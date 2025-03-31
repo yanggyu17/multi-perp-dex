@@ -40,7 +40,7 @@ ALL_MODULES = [
     Module.GET_POSITION,
     Module.CLOSE_POSITION,
     Module.GET_UNREALIZED_PNL,
-    Module.REDUCE_POSITION    
+    Module.REDUCE_POSITION
 ]
 SLEEP_BETWEEN_CALLS = 0.2
 
@@ -161,6 +161,14 @@ async def run_batch(title, exchanges, handler_fn):
                 print(f"{name}: {result} \n usdc_size: {usdc_size}")
             else:
                 print(f"{name}: {len(result) if result else 0} {result}")
+                if title == 'Check Collaterals':
+                    usdc = 0
+                    try:
+                        usdc += float(result['total_collateral'])
+                    except Exception as e:
+                        pass
+                    print(f"sum: {usdc}")
+                
     return dict(zip(names, results))
 
 
