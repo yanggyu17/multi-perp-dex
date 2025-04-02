@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import argparse
+import random
 from datetime import datetime
 import json
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ logging.getLogger().setLevel(logging.ERROR)
 
 # argparse to override select_module
 parser = argparse.ArgumentParser()
-parser.add_argument("--module", type=str, default="", help="Select module name [close,order,check]")
+parser.add_argument("--module", type=str, default="", help="Select module name [close,order,check,auto]")
 args = parser.parse_args()
 
 @dataclass(frozen=True)
@@ -43,16 +44,22 @@ ALL_MODULES = [
     Module.REDUCE_POSITION
 ]
 SLEEP_BETWEEN_CALLS = 0.2
+AUTO_RUN_TIMER = [60*30, 60*60] # between 30~60min
+MAX_ORDER_SIZE = 0.1
 
 # setting parameters
 coin = 'BTC'
-amount = 0.03
+amount = 0.01
 exchange_configs = {
-    'backpack': {'create': True, 'side': 'long', 'need_close': False, 'key_params': BACKPACK_KEY},
-    'edgex': {'create': True, 'side': 'long', 'need_close': False, 'key_params': EDGEX_KEY},
-    'paradex': {'create': True, 'side': 'short', 'need_close': True, 'key_params': PARADEX_KEY},
-    'lighter': {'create': True, 'side': 'short', 'need_close': True, 'key_params': LIGHTER_KEY},
-    'grvt': {'create': False, 'side': 'NA', 'need_close': True, 'key_params': GRVT_KEY},
+    'backpack': {'create': True, 'side': 'short', 'need_close': False, 'key_params': BACKPACK_KEY,'multiply':1},
+    
+    'edgex': {'create': False, 'side': 'NA', 'need_close': False, 'key_params': EDGEX_KEY,'multiply':1},
+    
+    'paradex': {'create': True, 'side': 'short', 'need_close': True, 'key_params': PARADEX_KEY,'multiply':1},
+    
+    'lighter': {'create': True, 'side': 'long', 'need_close': True, 'key_params': LIGHTER_KEY,'multiply':2},
+    
+    'grvt': {'create': False, 'side': 'NA', 'need_close': True, 'key_params': GRVT_KEY,'multiply':1},
 }
 
 select_module_to_keys = {
@@ -72,11 +79,16 @@ select_module_to_keys = {
     # 7 [1]check position -> [2]unrealized pnl
     'pnl': [Module.GET_POSITION, Module.GET_UNREALIZED_PNL],
     # 8 [1]reduce position -> [2]check position -> [3]get unrealized pnl
-    'reduce': [Module.REDUCE_POSITION, Module.GET_POSITION, Module.GET_UNREALIZED_PNL], 
+    'reduce': [Module.REDUCE_POSITION, Module.GET_POSITION, Module.GET_UNREALIZED_PNL],
+    
+    'check_auto': [Module.GET_COLLATERAL, Module.GET_POSITION], 
+    'order_auto': [Module.CREATE_ORDER_MARKET], 
+    'reduce_auto': [Module.REDUCE_POSITION], 
+    
 }
 # end of setting
-selected_keys = select_module_to_keys.get(args.module, select_module_to_keys["get_collateral"])
-run_modules = {k: (k in selected_keys) for k in ALL_MODULES}
+#selected_keys = select_module_to_keys.get(args.module, select_module_to_keys["get_collateral"])
+#run_modules = {k: (k in selected_keys) for k in ALL_MODULES}
 
 market_order_params = {
     'long': [{'side': 'buy', 'amount': amount}],
@@ -87,6 +99,10 @@ market_order_params_per_exchange = {
     for name, conf in exchange_configs.items()
     if conf['side'] in market_order_params
 }
+
+for k, v in market_order_params_per_exchange.items():
+    mul = exchange_configs[k]['multiply']
+    market_order_params_per_exchange[k][0]['amount'] = round(v[0]['amount']*mul, 3) # only for BTC
 
 limit_order_params = [
     {'price': 80000, 'side': 'buy', 'amount': 0.01},
@@ -148,6 +164,8 @@ async def run_batch(title, exchanges, handler_fn):
             print(f"[ERROR] {name}: {e}")
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    if title == 'Check Collaterals':
+        usdc = 0
     for name, result in zip(names, results):
         if isinstance(result, Exception):
             print(f"[ERROR] {name}: {result}")
@@ -162,7 +180,6 @@ async def run_batch(title, exchanges, handler_fn):
             else:
                 print(f"{name}: {len(result) if result else 0} {result}")
                 if title == 'Check Collaterals':
-                    usdc = 0
                     try:
                         usdc += float(result['total_collateral'])
                     except Exception as e:
@@ -171,91 +188,165 @@ async def run_batch(title, exchanges, handler_fn):
                 
     return dict(zip(names, results))
 
+def select_next_module(positions):
+    module_list = ['order_auto','reduce_auto']
+    next_module = random.choice(module_list)
+    #module_id = module_list.index(next_module)
+    
+    for name, v in positions.items():
+        if v == None:
+            return next_module
+        
+        eparam = market_order_params_per_exchange[name]
+        
+        order_side = eparam[0]['side'] # order일때의 주문방향, rever일때는 반대
+        order_amount = eparam[0]['amount']
+        
+        curr_side = v['side']
+        curr_size = v['size']
+        
+        next_amount = float(curr_size) if curr_side == 'long' else -float(curr_size)
+        if next_module == 'order_auto':
+            # +- real value
+            next_amount += float(order_amount) if order_side == 'buy' else -float(order_amount)
+        elif next_module == 'reduce_auto':
+            next_amount += -float(order_amount) if order_side == 'buy' else +float(order_amount)
+        
+        next_amount = round(next_amount,3)
+        #print("#####")
+        #print(next_module,name,'order_side:',order_side,order_amount,'currside:',curr_side,curr_size,next_amount,MAX_ORDER_SIZE)
+        #print("#####")
+        if abs(next_amount) >= MAX_ORDER_SIZE:
+            next_module = 'order_auto' if next_module == 'reduce_auto' else 'reduce_auto'
+            print(f'amount will exceed maximum order amount {MAX_ORDER_SIZE}, in next order {abs(next_amount)}')
+            print(f'so change to {next_module}')
+            return next_module
+            
+    return next_module
+    
 
 async def main():
-    print(f"[RUNNING MODULES] {', '.join(selected_keys)}")
-    exchanges = {
-        name: await create_exchange(name, key_params=cfg['key_params'])
-        for name, cfg in exchange_configs.items() if cfg['create']
-    }
-
-    open_orders = {}
-    positions = {}
-
-    for key in selected_keys:
-        if key == Module.GET_COLLATERAL:
-            await run_batch("Check Collaterals", exchanges, lambda n, e: e.get_collateral())
-
-        elif key == Module.CREATE_ORDER_LIMIT:
-            print('\n[V] Create Limit Orders (per exchange)')
-            async def limit_order_handler(name, ex):
-                symbol = symbol_create(name, coin)
-                results = []
-                for param in limit_order_params_per_exchange.get(name, []):
-                    print(' *limit order', name, param["side"], param["amount"], param['price'])
-                    res = await ex.create_order(symbol, param["side"], param["amount"], param["price"], "limit")
-                    results.append(res)
-                return results
-            await run_batch("Create Limit Orders", exchanges, limit_order_handler)
-
-        elif key == Module.GET_OPEN_ORDERS:
-            async def get_orders(n, e):
-                symbol = symbol_create(n, coin)
-                return await e.get_open_orders(symbol)
-            open_orders = await run_batch("Check Open Orders", exchanges, get_orders)
-
-        elif key == Module.CANCEL_ORDERS:
-            async def cancel(n, e):
-                symbol = symbol_create(n, coin)
-                orders = open_orders.get(n)
-                return await e.cancel_orders(symbol, orders)
-            await run_batch("Cancel Orders", exchanges, cancel)
-
-        elif key == Module.CREATE_ORDER_MARKET or key == Module.REDUCE_POSITION:
-            print('\n[V] Create Market Orders (per exchange)')
-            async def market_order_handler(name, ex):
-                symbol = symbol_create(name, coin)
-                results = []
-                for param in market_order_params_per_exchange.get(name, []):
-                    order_side = reverse_side(param['side']) if key == Module.REDUCE_POSITION else param['side']
-                    print(' *market order', name, order_side, param["amount"])
-                    res = await ex.create_order(symbol, order_side, param["amount"], None, "market")
-                    log_volume(name, coin, float(param["amount"]))
-                    results.append(res)
-                return results
-            await run_batch("Create Market Orders", exchanges, market_order_handler)
-
-        elif key == Module.GET_POSITION:
-            async def get_pos(n, e):
-                symbol = symbol_create(n, coin)
-                return await e.get_position(symbol)
-            positions = await run_batch("Check Positions", exchanges, get_pos)
+    positions = None
+    run_forever = False
+    if args.module == 'auto':
+        print(args.module)
+        run_forever = True
+    
+    run_cnt = 0
+    while True:
+        run_cnt += 1
+        
+        if run_forever:
+            module_select = ['check_auto','random'][run_cnt%2-1]
             
-
-        elif key == Module.CLOSE_POSITION:
-            async def close_pos(n, e):
-                symbol = symbol_create(n, coin)
-                pos = positions.get(n)
-                res = await e.close_position(symbol, pos)
-                if pos and res:  # 또는 res가 성공 조건일 경우 판단
-                    log_volume(n,coin,float(pos.get("size",0)),True,float(pos.get("entry_price",0)),float(pos.get("unrealized_pnl",0)))
-                return res
-            await run_batch("Close Positions", exchanges, close_pos)
+            if positions is not None and module_select == 'random':
+                module_select = select_next_module(positions)
+                #print('')
+                #print(run_cnt,next_module)
+                #print('')
+                if run_cnt >= 3:
+                    random_sleep_time = round(random.uniform(AUTO_RUN_TIMER[0], AUTO_RUN_TIMER[1]),1)
+                    print('will sleep',random_sleep_time)
+                    await asyncio.sleep(random_sleep_time)
+                    
+            #print('autorun',module_select)
+            selected_keys = select_module_to_keys.get(module_select, select_module_to_keys["get_collateral"])
+            
+        else:
+            selected_keys = select_module_to_keys.get(args.module, select_module_to_keys["get_collateral"])
         
-        elif key == Module.GET_UNREALIZED_PNL:
-            unrealized_pnl = 0
-            for n in positions:
-                pos = positions[n]
-                if pos is not None:
-                    unrealized_pnl += float(pos.get("unrealized_pnl",0))
-
-            print('Unrealized PNL = ', round(unrealized_pnl,2))
+        print(f"[RUNNING MODULES] {', '.join(selected_keys)}")
+        #if module_select == 'order' or module_select == 'reduce':
+        #    continue
         
-        await asyncio.sleep(SLEEP_BETWEEN_CALLS)
+        exchanges = {
+            name: await create_exchange(name, key_params=cfg['key_params'])
+            for name, cfg in exchange_configs.items() if cfg['create']
+        }
 
-    for name, ex in exchanges.items():
-        if exchange_configs[name]['need_close']:
-            await ex.close()
+        open_orders = {}
+        positions = {}
+
+        for key in selected_keys:
+            if key == Module.GET_COLLATERAL:
+                await run_batch("Check Collaterals", exchanges, lambda n, e: e.get_collateral())
+
+            elif key == Module.CREATE_ORDER_LIMIT:
+                print('\n[V] Create Limit Orders (per exchange)')
+                async def limit_order_handler(name, ex):
+                    symbol = symbol_create(name, coin)
+                    results = []
+                    for param in limit_order_params_per_exchange.get(name, []):
+                        print(' *limit order', name, param["side"], param["amount"], param['price'])
+                        res = await ex.create_order(symbol, param["side"], param["amount"], param["price"], "limit")
+                        results.append(res)
+                    return results
+                await run_batch("Create Limit Orders", exchanges, limit_order_handler)
+
+            elif key == Module.GET_OPEN_ORDERS:
+                async def get_orders(n, e):
+                    symbol = symbol_create(n, coin)
+                    return await e.get_open_orders(symbol)
+                open_orders = await run_batch("Check Open Orders", exchanges, get_orders)
+
+            elif key == Module.CANCEL_ORDERS:
+                async def cancel(n, e):
+                    symbol = symbol_create(n, coin)
+                    orders = open_orders.get(n)
+                    return await e.cancel_orders(symbol, orders)
+                await run_batch("Cancel Orders", exchanges, cancel)
+
+            elif key == Module.CREATE_ORDER_MARKET or key == Module.REDUCE_POSITION:
+                print('\n[V] Create Market Orders (per exchange)')
+                async def market_order_handler(name, ex):
+                    symbol = symbol_create(name, coin)
+                    results = []
+                    for param in market_order_params_per_exchange.get(name, []):
+                        order_side = reverse_side(param['side']) if key == Module.REDUCE_POSITION else param['side']
+                        print(' *market order', name, order_side, param["amount"])
+                        res = await ex.create_order(symbol, order_side, param["amount"], None, "market")
+                        log_volume(name, coin, float(param["amount"]))
+                        results.append(res)
+                    return results
+                await run_batch("Create Market Orders", exchanges, market_order_handler)
+
+            elif key == Module.GET_POSITION:
+                async def get_pos(n, e):
+                    symbol = symbol_create(n, coin)
+                    return await e.get_position(symbol)
+                positions = await run_batch("Check Positions", exchanges, get_pos)
+                
+
+            elif key == Module.CLOSE_POSITION:
+                async def close_pos(n, e):
+                    symbol = symbol_create(n, coin)
+                    pos = positions.get(n)
+                    res = await e.close_position(symbol, pos)
+                    if pos and res:  # 또는 res가 성공 조건일 경우 판단
+                        log_volume(n,coin,float(pos.get("size",0)),True,float(pos.get("entry_price",0)),float(pos.get("unrealized_pnl",0)))
+                    return res
+                await run_batch("Close Positions", exchanges, close_pos)
+            
+            elif key == Module.GET_UNREALIZED_PNL:
+                unrealized_pnl = 0
+                for n in positions:
+                    pos = positions[n]
+                    if pos is not None:
+                        unrealized_pnl += float(pos.get("unrealized_pnl",0))
+
+                print('Unrealized PNL = ', round(unrealized_pnl,2))
+            
+            await asyncio.sleep(SLEEP_BETWEEN_CALLS)
+
+        for name, ex in exchanges.items():
+            if exchange_configs[name]['need_close']:
+                await ex.close()
+        
+        if run_forever == False:
+            break
+        print('run complete', run_cnt)
+        print('')
+        await asyncio.sleep(2)
 
 if __name__ == "__main__":
         if args.module:  # 🔸 명령이 있을 때만 실행
