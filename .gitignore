@@ -25,3 +25,5 @@ volume_summary.json
 .gpt*
 gpt*
 .venv
+tailwatch.sh
+log_trim.py
