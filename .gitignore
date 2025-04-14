@@ -24,3 +24,4 @@ volume_summary.json
 
 .gpt*
 gpt*
+.venv
