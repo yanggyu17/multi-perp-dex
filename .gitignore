@@ -27,3 +27,5 @@ gpt*
 .venv
 tailwatch.sh
 log_trim.py
+
+main_copy.py

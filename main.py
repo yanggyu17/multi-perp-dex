@@ -44,20 +44,20 @@ ALL_MODULES = [
     Module.REDUCE_POSITION
 ]
 SLEEP_BETWEEN_CALLS = 0.2
-AUTO_RUN_TIMER = [60*20, 60*40] # between 30~60min
-MAX_ORDER_SIZE = 0.11
+AUTO_RUN_TIMER = [60*5, 60*10] # between 30~60min
+MAX_ORDER_SIZE = 0.13
 
 # setting parameters
 coin = 'BTC'
-amount = 0.025
+amount = 0.06
 exchange_configs = {
-    'backpack': {'create': True, 'side': 'short', 'need_close': False, 'key_params': BACKPACK_KEY,'multiply':1},
+    'backpack': {'create': False, 'side': 'short', 'need_close': False, 'key_params': BACKPACK_KEY,'multiply':2},
     
     'edgex': {'create': True, 'side': 'long', 'need_close': False, 'key_params': EDGEX_KEY,'multiply':1},
     
     'paradex': {'create': True, 'side': 'short', 'need_close': True, 'key_params': PARADEX_KEY,'multiply':1},
     
-    'lighter': {'create': True, 'side': 'long', 'need_close': True, 'key_params': LIGHTER_KEY,'multiply':1},
+    'lighter': {'create': False, 'side': 'long', 'need_close': True, 'key_params': LIGHTER_KEY,'multiply':1},
     
     'grvt': {'create': False, 'side': 'NA', 'need_close': True, 'key_params': GRVT_KEY,'multiply':1},
 }
@@ -87,22 +87,13 @@ select_module_to_keys = {
     
 }
 # end of setting
-#selected_keys = select_module_to_keys.get(args.module, select_module_to_keys["get_collateral"])
-#run_modules = {k: (k in selected_keys) for k in ALL_MODULES}
 
-market_order_params = {
-    'long': [{'side': 'buy', 'amount': amount}],
-    'short': [{'side': 'sell', 'amount': amount}],
-}
-market_order_params_per_exchange = {
-    name: market_order_params[conf['side']]
-    for name, conf in exchange_configs.items()
-    if conf['side'] in market_order_params
-}
+market_order_params_per_exchange = {}
 
-for k, v in market_order_params_per_exchange.items():
+for k, v in exchange_configs.items():
     mul = exchange_configs[k]['multiply']
-    market_order_params_per_exchange[k][0]['amount'] = round(v[0]['amount']*mul, 3) # only for BTC
+    side = 'buy' if exchange_configs[k]['side']=='long' else 'sell'
+    market_order_params_per_exchange[k] = {'side':side,'amount': round(amount*mul,3)}
 
 limit_order_params = [
     {'price': 80000, 'side': 'buy', 'amount': 0.01},
@@ -199,8 +190,8 @@ def select_next_module(positions):
         
         eparam = market_order_params_per_exchange[name]
         
-        order_side = eparam[0]['side'] # order일때의 주문방향, rever일때는 반대
-        order_amount = eparam[0]['amount']
+        order_side = eparam['side'] # order일때의 주문방향, rever일때는 반대
+        order_amount = eparam['amount']
         
         curr_side = v['side']
         curr_size = v['size']
@@ -301,12 +292,13 @@ async def main():
                 async def market_order_handler(name, ex):
                     symbol = symbol_create(name, coin)
                     results = []
-                    for param in market_order_params_per_exchange.get(name, []):
-                        order_side = reverse_side(param['side']) if key == Module.REDUCE_POSITION else param['side']
-                        print(' *market order', name, order_side, param["amount"])
-                        res = await ex.create_order(symbol, order_side, param["amount"], None, "market")
-                        log_volume(name, coin, float(param["amount"]))
-                        results.append(res)
+                    
+                    param = market_order_params_per_exchange.get(name, {})
+                    order_side = reverse_side(param['side']) if key == Module.REDUCE_POSITION else param['side']
+                    print(' *market order', name, order_side, param["amount"])
+                    res = await ex.create_order(symbol, order_side, param["amount"], None, "market")
+                    log_volume(name, coin, float(param["amount"]))
+                    results.append(res)
                     return results
                 await run_batch("Create Market Orders", exchanges, market_order_handler)
 
