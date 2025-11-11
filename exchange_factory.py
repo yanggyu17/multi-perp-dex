@@ -1,23 +1,34 @@
-from wrappers.paradex import ParadexExchange
-from wrappers.edgex import EdgexExchange
-from wrappers.lighter import LighterExchange
-from wrappers.grvt import GrvtExchange
-from wrappers.backpack import BackpackExchange
+import importlib  # [ADDED]
 
-async def create_exchange(exchange_name: str, key_params=None):
+def _load(exchange_name: str):  # [ADDED] 필요한 경우에만 모듈 로드
+    mapping = {
+        "paradex": ("wrappers.paradex", "ParadexExchange"),
+        "edgex": ("wrappers.edgex", "EdgexExchange"),
+        "lighter": ("wrappers.lighter", "LighterExchange"),
+        "grvt": ("wrappers.grvt", "GrvtExchange"),
+        "backpack": ("wrappers.backpack", "BackpackExchange"),
+    }
+    try:
+        mod, cls = mapping[exchange_name]
+    except KeyError:
+        raise ValueError(f"Unsupported exchange: {exchange_name}")
+    module = importlib.import_module(mod)
+    return getattr(module, cls)
+
+async def create_exchange(exchange_name: str, key_params=None):  # [MODIFIED] 지연 로드 사용
     if key_params is None:
         raise ValueError(f"[ERROR] key_params is required for exchange: {exchange_name}")
-    
+    Ex = _load(exchange_name)  # [ADDED]
     if exchange_name == "paradex":
-        return ParadexExchange(key_params.wallet_address, key_params.paradex_address, key_params.paradex_private_key)
+        return Ex(key_params.wallet_address, key_params.paradex_address, key_params.paradex_private_key)
     elif exchange_name == "edgex":
-        return await EdgexExchange(key_params.account_id, key_params.private_key).init()
+        return await Ex(key_params.account_id, key_params.private_key).init()
     elif exchange_name == "grvt":
-        return await GrvtExchange(key_params.api_key, key_params.account_id, key_params.secret_key ).init()
+        return await Ex(key_params.api_key, key_params.account_id, key_params.secret_key ).init()
     elif exchange_name == "backpack":
-        return BackpackExchange(key_params.api_key, key_params.secret_key)
+        return Ex(key_params.api_key, key_params.secret_key)
     elif exchange_name == "lighter":
-        return await LighterExchange(key_params.account_id, key_params.private_key, key_params.api_key_id, key_params.l1_address).initialize_market_info()
+        return await Ex(key_params.account_id, key_params.private_key, key_params.api_key_id, key_params.l1_address).initialize_market_info()
     else:
         raise ValueError(f"Unsupported exchange: {exchange_name}")
 

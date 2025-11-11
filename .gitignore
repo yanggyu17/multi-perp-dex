@@ -29,3 +29,5 @@ tailwatch.sh
 log_trim.py
 
 main_copy.py
+.dsignore
+directory_*
