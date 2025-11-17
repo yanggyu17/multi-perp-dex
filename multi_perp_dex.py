@@ -24,7 +24,11 @@ class MultiPerpDex(ABC):
     @abstractmethod
     async def cancel_orders(self, symbol):
         pass
-    
+
+    @abstractmethod
+    async def get_mark_price(self,symbol):
+        pass
+
 class MultiPerpDexMixin:
     async def get_open_orders(self, symbol):
         return await self.exchange.fetch_open_orders(symbol)

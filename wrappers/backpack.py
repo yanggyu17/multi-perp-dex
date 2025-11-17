@@ -46,6 +46,12 @@ class BackpackExchange(MultiPerpDexMixin, MultiPerpDex):
             for o in orders
         ]
 
+    async def get_mark_price(self,symbol):
+        async with aiohttp.ClientSession() as session:
+            res = await self._get_mark_prices(session, symbol)
+            price = res[0]['markPrice']
+            return price
+
     async def create_order(self, symbol, side, amount, price=None, order_type='market'):
         if price != None:
             order_type = 'limit'
@@ -162,7 +168,17 @@ class BackpackExchange(MultiPerpDexMixin, MultiPerpDex):
             'available_collateral':round(float(collateral['netEquityAvailable']),2),
             'total_collateral':round(float(collateral['assetsValue']),2),
         }
-        return coll_return    
+        return coll_return
+
+    async def _get_mark_prices(self, session, symbol):
+        """
+        [{'fundingRate': '0.0000125', 'indexPrice': '95049.3749273', 'markPrice': '95075.00410592', 'nextFundingTimestamp': 1763362800000, 'symbol': 'BTC_USDC_PERP'}]
+        """
+        url = f"{self.BASE_URL}/markPrices"
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        params = {"symbol": symbol}
+        async with session.get(url, headers=headers, params=params) as resp:
+            return await resp.json()
     
     async def _get_market_info(self, session, symbol):
         url = f"{self.BASE_URL}/market"

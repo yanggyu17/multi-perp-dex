@@ -81,6 +81,9 @@ class EdgexExchange(MultiPerpDexMixin, MultiPerpDex):
         
         return stark_signature, timestamp
 
+    async def get_mark_price(self,symbol):
+        pass
+
     async def create_order(self, symbol, side, amount, price=None, order_type='market'):
         LIMIT_ORDER_WITH_FEES = 3
         if price != None:

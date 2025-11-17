@@ -18,14 +18,13 @@ async def main():
     print(coll)
     await asyncio.sleep(0.1)
     
-    '''
     # limit sell
-    res = await paradex.create_order(symbol, 'sell', 0.005, price=85000)
+    res = await paradex.create_order(symbol, 'sell', 0.001, price=110000)
     print(res)
     await asyncio.sleep(0.1)
     
     # limit buy
-    res = await paradex.create_order(symbol, 'buy', 0.005, price=80000)
+    res = await paradex.create_order(symbol, 'buy', 0.001, price=100000)
     print(res)
     await asyncio.sleep(0.1)
     
@@ -42,22 +41,22 @@ async def main():
     # market buy
     res = await paradex.create_order(symbol, 'buy', 0.005)
     print(res)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
         
     # market sell
     res = await paradex.create_order(symbol, 'sell', 0.004)
     print(res)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
     
     # get position
     position = await paradex.get_position(symbol)
     print(position)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
     
     # open position close
-    #res = await paradex.close_position(symbol, position)
-    #print(res)
-    '''
+    res = await paradex.close_position(symbol, position)
+    print(res)
+    
     await paradex.close()
     
 if __name__ == "__main__":

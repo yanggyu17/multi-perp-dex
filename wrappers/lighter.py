@@ -45,6 +45,9 @@ class LighterExchange(MultiPerpDexMixin, MultiPerpDex):
     
     async def close(self):
         await self.client.close()
+    
+    async def get_mark_price(self,symbol):
+        pass
 
     async def create_order(self, symbol, side, amount, price=None, order_type='market'):
         if price is not None:

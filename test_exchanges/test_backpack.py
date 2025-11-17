@@ -15,6 +15,9 @@ async def main():
     #position = await backpack.get_position(symbol)
     #print(position)
     
+    price = await backpack.get_mark_price(symbol)
+    print(price)
+
     coll = await backpack.get_collateral()
     print(coll)
     await asyncio.sleep(0.2)
