@@ -42,8 +42,10 @@ class ParadexExchange(MultiPerpDexMixin, MultiPerpDex):
             "size": position.get("size").replace('-','')
         }
     
-    async def get_mark_price(self,symbol):
-        pass
+    async def get_mark_price(self, symbol):
+        res = await self.exchange.fetch_ticker(symbol)
+        price = res['last']
+        return price
         
     async def create_order(self, symbol, side, amount, price=None, order_type='market'):
         if price != None:

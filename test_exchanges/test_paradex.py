@@ -14,10 +14,13 @@ symbol = f'{coin}-USD-PERP'
 async def main():
     paradex = await create_exchange('paradex',PARADEX_KEY)
 
+    price = await paradex.get_mark_price(symbol)
+    print(price)
+
     coll = await paradex.get_collateral()
     print(coll)
     await asyncio.sleep(0.1)
-    
+    '''
     # limit sell
     res = await paradex.create_order(symbol, 'sell', 0.001, price=110000)
     print(res)
@@ -56,7 +59,7 @@ async def main():
     # open position close
     res = await paradex.close_position(symbol, position)
     print(res)
-    
+    '''
     await paradex.close()
     
 if __name__ == "__main__":
