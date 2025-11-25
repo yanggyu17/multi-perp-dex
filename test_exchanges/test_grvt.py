@@ -19,7 +19,6 @@ async def main():
 
     position = await grvt.get_position(symbol)
     print(position)
-    '''
     coll = await grvt.get_collateral()
     print(coll)
     
@@ -29,6 +28,7 @@ async def main():
     print(res)
     await asyncio.sleep(0.1)
     
+    '''
     # limit buy
     res = await grvt.create_order(symbol, 'buy', 0.001, price=100000)
     print(res)
