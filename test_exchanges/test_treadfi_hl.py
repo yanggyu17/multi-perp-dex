@@ -22,7 +22,7 @@ async def main():
     #print(res)
     #await asyncio.sleep(0.2)
 
-    await treadfi_hl.aclose()
+    #await treadfi_hl.aclose()
     #print(treadfi_hl)
     #position = await treadfi_hl.get_position(symbol)
     #print(position)
