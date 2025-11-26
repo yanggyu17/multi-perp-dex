@@ -11,16 +11,18 @@ symbol = symbol_create('treadfi_hl',coin) # only perp atm
 
 async def main():
     treadfi_hl = await create_exchange('treadfi_hl',TREADFIHL_KEY)
-    #res = await treadfi_hl.login()
-    #print(res)
-    
-    #res = await treadfi_hl.logout()
-    #print(res)
 
+    # login
+    res = await treadfi_hl.login()
+    print(res)
+    
     # limit buy
-    #res = await treadfi_hl.create_order(symbol, 'sell', 0.00015)
-    #print(res)
-    #await asyncio.sleep(0.2)
+    res = await treadfi_hl.create_order(symbol, 'sell', 0.00015, price=85000)
+    print(res)
+    
+    # logout
+    res = await treadfi_hl.logout()
+    print(res)
 
     #await treadfi_hl.aclose()
     #print(treadfi_hl)

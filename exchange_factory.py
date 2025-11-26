@@ -1,6 +1,6 @@
 import importlib  # [ADDED]
 
-def _load(exchange_name: str):  # [ADDED] 필요한 경우에만 모듈 로드
+def _load(exchange_platform: str):  # [ADDED] 필요한 경우에만 모듈 로드
     mapping = {
         "paradex": ("wrappers.paradex", "ParadexExchange"),
         "edgex": ("wrappers.edgex", "EdgexExchange"),
@@ -10,30 +10,30 @@ def _load(exchange_name: str):  # [ADDED] 필요한 경우에만 모듈 로드
         "treadfi_hl": ("wrappers.treadfi_hl", "TreadfiHlExchange"),
     }
     try:
-        mod, cls = mapping[exchange_name]
+        mod, cls = mapping[exchange_platform]
     except KeyError:
-        raise ValueError(f"Unsupported exchange: {exchange_name}")
+        raise ValueError(f"Unsupported exchange: {exchange_platform}")
     module = importlib.import_module(mod)
     return getattr(module, cls)
 
-async def create_exchange(exchange_name: str, key_params=None):  # [MODIFIED] 지연 로드 사용
+async def create_exchange(exchange_platform: str, key_params=None):  # [MODIFIED] 지연 로드 사용
     if key_params is None:
-        raise ValueError(f"[ERROR] key_params is required for exchange: {exchange_name}")
-    Ex = _load(exchange_name)  # [ADDED]
-    if exchange_name == "paradex":
+        raise ValueError(f"[ERROR] key_params is required for exchange: {exchange_platform}")
+    Ex = _load(exchange_platform)  # [ADDED]
+    if exchange_platform == "paradex":
         return Ex(key_params.wallet_address, key_params.paradex_address, key_params.paradex_private_key)
-    elif exchange_name == "edgex":
+    elif exchange_platform == "edgex":
         return await Ex(key_params.account_id, key_params.private_key).init()
-    elif exchange_name == "grvt":
+    elif exchange_platform == "grvt":
         return await Ex(key_params.api_key, key_params.account_id, key_params.secret_key ).init()
-    elif exchange_name == "backpack":
+    elif exchange_platform == "backpack":
         return Ex(key_params.api_key, key_params.secret_key)
-    elif exchange_name == "lighter":
+    elif exchange_platform == "lighter":
         return await Ex(key_params.account_id, key_params.private_key, key_params.api_key_id, key_params.l1_address).initialize_market_info()
-    elif exchange_name == "treadfi_hl":
+    elif exchange_platform == "treadfi_hl":
         return Ex(key_params.session_cookies, key_params.evm_private_key, key_params.main_wallet_address, key_params.sub_wallet_address, key_params.account_name)
     else:
-        raise ValueError(f"Unsupported exchange: {exchange_name}")
+        raise ValueError(f"Unsupported exchange: {exchange_platform}")
 
 SYMBOL_FORMATS = {
     "paradex":  lambda c: f"{c}-USD-PERP",
@@ -44,9 +44,9 @@ SYMBOL_FORMATS = {
     "treadfi_hl": lambda coin: f"{coin.split(':')[0]}_{coin.split(':')[1]}:PERP-USDC" if ":" in coin else f"{coin}:PERP-USDC"
 }
 
-def symbol_create(exchange_name: str, coin: str):
+def symbol_create(exchange_platform: str, coin: str):
     coin = coin.upper()
     try:
-        return SYMBOL_FORMATS[exchange_name](coin)
+        return SYMBOL_FORMATS[exchange_platform](coin)
     except KeyError:
-        raise ValueError(f"Unsupported exchange: {exchange_name}, coin: {coin}")
+        raise ValueError(f"Unsupported exchange: {exchange_platform}, coin: {coin}")
