@@ -22,7 +22,7 @@ def __getattr__(name):  # [ADDED]
         "EdgexExchange": ("wrappers.edgex", "EdgexExchange"),
         "GrvtExchange": ("wrappers.grvt", "GrvtExchange"),
         "ParadexExchange": ("wrappers.paradex", "ParadexExchange"),
-        "TreadfiHlExchange": ("wrappers.treadfi_hl.py","TreadfiHlExchange")
+        "TreadfiHlExchange": ("wrappers.treadfi_hl","TreadfiHlExchange")
     }
     if name in mapping:
         mod, attr = mapping[name]
