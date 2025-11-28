@@ -13,6 +13,7 @@
 - Edgex (직접 서명 구현)
 - Backpack (공식 REST)
 - TreadFi (프론트 api 사용) / login, logout, create_order 가능
+- Variational (프론트 api 사용)
 
 ---
 
@@ -60,6 +61,8 @@ wrappers/               # 거래소별 래퍼 구현
   paradex.py
   treadfi_hl.py
   treadfi_login.html
+  variational_auth.py
+  variational.py
 mpdex/__init__.py       # 공개 API(지연 임포트), create_exchange/symbol_create 노출
 multi_perp_dex.py       # 공통 인터페이스(추상 클래스) 및 Mixin
 exchange_factory.py     # 문자열→래퍼 매핑, 지연 임포트 및 심볼 생성
@@ -81,6 +84,7 @@ cp keys/copy.pk_paradex.py  keys/pk_paradex.py
 cp keys/copy.pk_edgex.py    keys/pk_edgex.py
 cp keys/copy.pk_backpack.py keys/pk_backpack.py
 cp keys/copy.pk_treadfi_hl.py keys/pk_treadfi_hl.py
+cp keys/copy.pk_variational.py keys/variational.py
 ```
 
 템플릿은 아래와 같이 Dataclass로 정의되어 있으며, `exchange_factory.create_exchange()`가 요구하는 필드명을 그대로 사용합니다.
@@ -90,7 +94,11 @@ cp keys/copy.pk_treadfi_hl.py keys/pk_treadfi_hl.py
 - Paradex: wallet_address(str), paradex_address(str), paradex_private_key(str)
 - Edgex: account_id(str), private_key(str)
 - Backpack: api_key(str), secret_key(str)
+- Tread.fi: session_cookies(dick, optional), evm_private_key(str, optional), main_wallet_address(str, required), sub_wallet_address(str, required), account_name(str, required)
+- Variational: evm_wallet_address(str, required), session_cookies(dict, optional), evm_private_key(str, optional)
 
+- Tread.fi의 sub_wallet_address는 sub-account의 주소이며, 쓰지 않는 경우 main_wallet_address와 동일하게 작성하면 됩니다. session cookies를 알고 있다면, 별도의 로그인 절차가 필요 없습니다.
+- Variational: vr-token을 알고 있다면 별도의 로그인 절차가 필요 없습니다.
 ---
 
 ## 심볼 규칙
@@ -103,6 +111,7 @@ cp keys/copy.pk_treadfi_hl.py keys/pk_treadfi_hl.py
 - Backpack: `f"{COIN}_USDC_PERP"` (예: BTC_USDC_PERP)
 - Lighter: 코인 심볼 그대로(예: BTC)
 - TreadFi: `f"{COIN}:PERP-USDC"` 덱스 사용시, `f"{DEX}_{COIN}:PERP-USDC"`, 스팟 현재 미지원
+- Variational: `f"{COIN}"`
 
 ```python
 from mpdex import symbol_create
@@ -294,6 +303,8 @@ python test_exchanges/test_grvt.py
 python test_exchanges/test_paradex.py
 python test_exchanges/test_edgex.py
 python test_exchanges/test_backpack.py
+python test_exchanges/test_treadfi_hl.py
+python test_exchanges/test_variational.py
 ```
 
 ---

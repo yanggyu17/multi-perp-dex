@@ -22,7 +22,8 @@ def __getattr__(name):  # [ADDED]
         "EdgexExchange": ("wrappers.edgex", "EdgexExchange"),
         "GrvtExchange": ("wrappers.grvt", "GrvtExchange"),
         "ParadexExchange": ("wrappers.paradex", "ParadexExchange"),
-        "TreadfiHlExchange": ("wrappers.treadfi_hl","TreadfiHlExchange")
+        "TreadfiHlExchange": ("wrappers.treadfi_hl","TreadfiHlExchange"),
+        "VariationalExchange": ("wrappers.variational","VariationalExchange")
     }
     if name in mapping:
         mod, attr = mapping[name]
@@ -33,5 +34,6 @@ def __getattr__(name):  # [ADDED]
 __all__ = [  # [ADDED] 공개 심볼 명시
     "MultiPerpDex", "MultiPerpDexMixin",
     "create_exchange", "symbol_create",
-    "LighterExchange", "BackpackExchange", "EdgexExchange", "GrvtExchange", "ParadexExchange", "TreadfiHlExchange"
+    "LighterExchange", "BackpackExchange", "EdgexExchange", "GrvtExchange", "ParadexExchange", "TreadfiHlExchange",
+    "VariationalExchange"
 ]
