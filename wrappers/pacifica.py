@@ -1,5 +1,5 @@
 from multi_perp_dex import MultiPerpDexMixin, MultiPerpDex
-from utils.common_pacifica import sign_message
+from mpdex.utils.common_pacifica import sign_message
 import time
 import uuid
 import requests
