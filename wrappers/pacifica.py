@@ -105,7 +105,8 @@ class PacificaExchange(MultiPerpDexMixin, MultiPerpDex):
         self._symbol_meta = meta
         self._symbol_list = sorted(set(symbols))
         self._initialized = True
-        return {"ok": True, "meta":self._symbol_meta, "symbols": list(self._symbol_list) }
+        #return {"ok": True, "meta":self._symbol_meta, "symbols": list(self._symbol_list) }
+        return self
     
     async def initialize_if_needed(self):  # [ADDED]
         if not self._initialized:
