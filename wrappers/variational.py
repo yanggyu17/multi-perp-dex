@@ -344,7 +344,7 @@ class VariationalExchange(MultiPerpDexMixin, MultiPerpDex):
                 await self._auth.login(port=None)
             else:
                 print("로그인이 필요합니다. 아래 나오는 로컬서버를 열고 지갑 서명을 진행하쇼.")
-                port = int(self.options.get("login_port", 7080))
+                port = int(self.options.get("login_port", 7469))
                 await self._auth.login(port=port, open_browser=True)
             new_vr = _load_vr_token_from_cache(self.address)
             if new_vr and await self._probe_cookie_valid(new_vr):
