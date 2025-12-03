@@ -3,6 +3,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from exchange_factory import create_exchange, symbol_create
 import asyncio
+import time
 #from keys.pk_hyperliquid import HYPERLIQUID_KEY
 
 # test done
@@ -15,7 +16,14 @@ async def main():
     res = await hyperliquid.init() # login and initialize
     print(hyperliquid.spot_index_to_name)
     print(hyperliquid.spot_name_to_index)
+    print(hyperliquid.dex_list)
 
+    res = await hyperliquid.create_ws_client()
+
+    while True:
+        price = hyperliquid.ws_client.get_price("xyz:XYZ100")
+        print(price)
+        await asyncio.sleep(1)
 
     return
     

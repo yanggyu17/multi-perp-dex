@@ -7,7 +7,7 @@ import re
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib import request as urllib_request
 from urllib.error import URLError, HTTPError
 import json
@@ -156,7 +156,6 @@ class HLWSClientRaw:
         self.spot_prices: Dict[str, float] = {}         # BASE → px (QUOTE=USDC일 때만)
         self.spot_pair_prices: Dict[str, float] = {}    # 'BASE/QUOTE' → px
         self.positions: Dict[str, Dict[str, Any]] = {}
-        self.balances: Dict[str, float] = {}      # 'USDC'/'USDH' 등
 
         # 재연결 시 재구독용
         self._subscriptions: List[Dict[str, Any]] = []
@@ -176,422 +175,63 @@ class HLWSClientRaw:
         # 매핑 준비 전 수신된 '@{index}' 가격을 보류
         self._pending_spot_mids: Dict[int, float] = {}
 
-        # [추가] 디버깅 히트 카운터(로그 스팸 완화)
-        self._spot_log_hits_idx: Dict[int, int] = {}
-        self._spot_log_hits_pair: Dict[str, int] = {}
-
-
-        # [추가] 디버그 타깃(옵션으로 주입)
-        self.debug_spot_indexes: set[int] = set()
-        self.debug_spot_bases: set[str] = set()
-        self.log_raw_allmids: bool = False
-        self.spot_log_min_level: int = logging.INFO
-
         # webData3 기반 캐시
-        self.web3_margin: Dict[str, float] = {}                       # {'accountValue': float, 'withdrawable': float, ...}
-        self.web3_perp_meta: Dict[str, Dict[str, Any]] = {}           # coin -> {'szDecimals': int, 'maxLeverage': int|None, 'onlyIsolated': bool}
-        self.web3_asset_ctxs: Dict[str, Dict[str, Any]] = {}          # coin -> assetCtx(dict)
-        self.web3_positions: Dict[str, Dict[str, Any]] = {}           # coin -> position(dict)
-        self.web3_open_orders: List[Dict[str, Any]] = []              # raw list
-        self.web3_spot_balances: Dict[str, float] = {}                # token -> total
-        self.web3_spot_pair_ctxs: Dict[str, Dict[str, Any]] = {}      # 'BASE/QUOTE' -> ctx(dict)
-        self.web3_spot_base_px: Dict[str, float] = {}                 # BASE -> px (QUOTE=USDC일 때)
-        self.web3_collateral_quote: Optional[str] = None              # 예: 'USDC'
-        self.web3_server_time: Optional[int] = None                   # ms
-        self.web3_agent: Dict[str, Any] = {}                          # {'address': .., 'validUntil': ..}
-        self.web3_positions_norm: Dict[str, Dict[str, Any]] = {}  # coin -> normalized position
+        self.margin: Dict[str, float] = {}                       # {'accountValue': float, 'withdrawable': float, ...}
+        self.perp_meta: Dict[str, Dict[str, Any]] = {}           # coin -> {'szDecimals': int, 'maxLeverage': int|None, 'onlyIsolated': bool}
+        self.asset_ctxs: Dict[str, Dict[str, Any]] = {}          # coin -> assetCtx(dict)
+        self.positions: Dict[str, Dict[str, Any]] = {}           # coin -> position(dict)
+        self.open_orders: List[Dict[str, Any]] = []              # raw list
+        self.balances: Dict[str, float] = {}                          # token -> total
+        self.spot_pair_ctxs: Dict[str, Dict[str, Any]] = {}      # 'BASE/QUOTE' -> ctx(dict)
+        self.spot_base_px: Dict[str, float] = {}                 # BASE -> px (QUOTE=USDC일 때)
+        self.collateral_quote: Optional[str] = None              # 예: 'USDC'
+        self.server_time: Optional[int] = None                   # ms
+        self.agent: Dict[str, Any] = {}                          # {'address': .., 'validUntil': ..}
+        self.positions_norm: Dict[str, Dict[str, Any]] = {}  # coin -> normalized position
         
         # [추가] webData3 DEX별 캐시/순서
-        self.web3_dex_keys: List[str] = ["hl", "xyz", "flx", "vntl"]  # 인덱스→DEX 키 매핑 우선순위
-        self.web3_margin_by_dex: Dict[str, Dict[str, float]] = {}     # dex -> {'accountValue', 'withdrawable', ...}
-        self.web3_positions_by_dex_norm: Dict[str, Dict[str, Dict[str, Any]]] = {}  # dex -> {coin -> norm pos}
-        self.web3_positions_by_dex_raw: Dict[str, List[Dict[str, Any]]] = {}         # dex -> raw assetPositions[*].position 목록
-        self.web3_asset_ctxs_by_dex: Dict[str, List[Dict[str, Any]]] = {}            # dex -> assetCtxs(raw list)
-        self.web3_total_account_value: float = 0.0
+        self.dex_keys: List[str] = ["hl", "xyz", "flx", "vntl"]  # 인덱스→DEX 키 매핑 우선순위
+        self.margin_by_dex: Dict[str, Dict[str, float]] = {}     # dex -> {'accountValue', 'withdrawable', ...}
+        self.positions_by_dex_norm: Dict[str, Dict[str, Dict[str, Any]]] = {}  # dex -> {coin -> norm pos}
+        self.positions_by_dex_raw: Dict[str, List[Dict[str, Any]]] = {}         # dex -> raw assetPositions[*].position 목록
+        self.asset_ctxs_by_dex: Dict[str, List[Dict[str, Any]]] = {}            # dex -> assetCtxs(raw list)
+        self.total_account_value: float = 0.0
 
         self._send_lock = asyncio.Lock()
         self._active_subs: set[str] = set()  # 이미 보낸 구독의 키 집합
 
-    async def _send_subscribe(self, sub: dict) -> None:
-        """subscribe 메시지 전송(중복 방지)."""
-        key = _sub_key(sub)
-        if key in self._active_subs:
-            return
-        async with self._send_lock:
-            if key in self._active_subs:
-                return
-            payload = {"method": "subscribe", "subscription": sub}
-            await self.conn.send(json.dumps(payload, separators=(",", ":")))
-            self._active_subs.add(key)
-
-    async def ensure_core_subs(self) -> None:
-        """
-        스코프별 필수 구독을 보장:
-        - allMids: 가격(이 스코프 문맥)
-        - webData3/spotState: 주소가 있을 때만
-        """
-        # 1) 가격(스코프별)
-        if self.dex:
-            await self._send_subscribe({"type": "allMids", "dex": self.dex})
-        else:
-            await self._send_subscribe({"type": "allMids"})
-        # 2) 주소 구독(webData3/spotState)
-        if self.address:
-            await self._send_subscribe({"type": "webData3", "user": self.address})
-            await self._send_subscribe({"type": "spotState", "user": self.address})
-
-    async def ensure_subscribe_active_asset(self, coin: str) -> None:
-        """
-        필요 시 코인 단위 포지션 스트림까지 구독(선택).
-        보통 webData3로 충분하므로 기본은 호출 필요 없음.
-        """
-        sub = {"type": "activeAssetData", "coin": coin}
-        if self.address:
-            sub["user"] = self.address
-        await self._send_subscribe(sub)
-
-    @staticmethod
-    def discover_perp_dexs_http(http_base: str, timeout: float = 8.0) -> list[str]:
-        """
-        POST {http_base}/info {"type":"perpDexs"} → [{'name':'xyz'}, {'name':'flx'}, ...]
-        반환: ['xyz','flx','vntl', ...] (소문자)
-        """
-        url = f"{http_base.rstrip('/')}/info"
-        payload = {"type":"perpDexs"}
-        headers = {"Content-Type": "application/json"}
-        def _post():
-            data = json_dumps(payload).encode("utf-8")
-            req = urllib_request.Request(url, data=data, headers=headers, method="POST")
-            with urllib_request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        try:
-            resp = _post()
-            out = []
-            if isinstance(resp, list):
-                for e in resp:
-                    n = (e or {}).get("name")
-                    if n:
-                        out.append(str(n).lower())
-            # 중복 제거/정렬
-            return sorted(set(out))
-        except (HTTPError, URLError):
-            return []
-        except Exception:
-            return []
-        
-    def _dex_key_by_index(self, i: int) -> str:
-        """perpDexStates 배열 인덱스를 DEX 키로 매핑. 부족하면 'dex{i}' 사용."""
-        return self.web3_dex_keys[i] if 0 <= i < len(self.web3_dex_keys) else f"dex{i}"
-
-    def set_web3_dex_order(self, order: List[str]) -> None:
-        """DEX 표시 순서를 사용자 정의로 교체. 예: ['hl','xyz','flx','vntl']"""
-        try:
-            ks = [str(k).lower().strip() for k in order if str(k).strip()]
-            if ks:
-                self.web3_dex_keys = ks
-        except Exception:
-            pass
-
-    def get_dex_keys(self) -> List[str]:
-        """현재 스냅샷에 존재하는 DEX 키(순서 보장)를 반환."""
-        present = [k for k in self.web3_dex_keys if k in self.web3_margin_by_dex]
-        # web3_dex_keys 외의 임시 dex{i}가 있을 수 있으므로 뒤에 덧붙임
-        extras = [k for k in self.web3_margin_by_dex.keys() if k not in present]
-        return present + sorted(extras)
-
-    def get_total_account_value_web3(self) -> float:
-        """webData3 기준 전체 AV 합계."""
-        try:
-            return float(sum(float((v or {}).get("accountValue", 0.0)) for v in self.web3_margin_by_dex.values()))
-        except Exception:
-            return 0.0
-
-    def get_account_value_by_dex(self, dex: Optional[str] = None) -> Optional[float]:
-        d = self.web3_margin_by_dex.get((dex or "hl").lower())
-        if not d: return None
-        try: return float(d.get("accountValue"))
-        except Exception: return None
-
-    def get_withdrawable_by_dex(self, dex: Optional[str] = None) -> Optional[float]:
-        d = self.web3_margin_by_dex.get((dex or "hl").lower())
-        if not d: return None
-        try: return float(d.get("withdrawable"))
-        except Exception: return None
-
-    def get_margin_summary_by_dex(self, dex: Optional[str] = None) -> Dict[str, float]:
-        return dict(self.web3_margin_by_dex.get((dex or "hl").lower(), {}))
-
-    def get_positions_by_dex(self, dex: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-        return dict(self.web3_positions_by_dex_norm.get((dex or "hl").lower(), {}))
-
-    def get_asset_ctxs_by_dex(self, dex: Optional[str] = None) -> List[Dict[str, Any]]:
-        return list(self.web3_asset_ctxs_by_dex.get((dex or "hl").lower(), []))
-
-    def _update_from_webData3(self, data: Dict[str, Any]) -> None:
-        """
-        webData3 포맷을 DEX별로 분리 파싱해 내부 캐시에 반영.
-        data 구조:
-        - userState: {...}
-        - perpDexStates: [ { clearinghouseState, assetCtxs, ...}, ... ]  # HL, xyz, flx, vntl 순
-        """
-        try:
-            # userState(참고/보조)
-            user_state = data.get("userState") or {}
-            
-            self.web3_server_time = user_state.get("serverTime") or self.web3_server_time
-            if user_state.get("user"):
-                self.web3_agent["user"] = user_state.get("user")
-            if user_state.get("agentAddress"):
-                self.web3_agent["agentAddress"] = user_state["agentAddress"]
-            if user_state.get("agentValidUntil"):
-                self.web3_agent["agentValidUntil"] = user_state["agentValidUntil"]
-            
-            dex_states = data.get("perpDexStates") or []
-            
-            # 누적 합계 재계산
-            self.web3_total_account_value = 0.0
-
-
-            for i, st in enumerate(dex_states):
-                dex_key = self._dex_key_by_index(i)
-                ch = (st or {}).get("clearinghouseState") or {}
-                ms = ch.get("marginSummary") or {}
-
-                # 숫자 변환
-                def fnum(x, default=0.0):
-                    try: return float(x)
-                    except Exception: return default
-
-                margin = {
-                    "accountValue": fnum(ms.get("accountValue")),
-                    "totalNtlPos":  fnum(ms.get("totalNtlPos")),
-                    "totalRawUsd":  fnum(ms.get("totalRawUsd")),
-                    "totalMarginUsed": fnum(ms.get("totalMarginUsed")),
-                    "crossMaintenanceMarginUsed": fnum(ch.get("crossMaintenanceMarginUsed")),
-                    "withdrawable": fnum(ch.get("withdrawable")),
-                    "time": ch.get("time"),
-                }
-                self.web3_margin_by_dex[dex_key] = margin
-                self.web3_total_account_value += float(margin["accountValue"])
-
-                # 포지션(정규화/원본)
-                norm_map: Dict[str, Dict[str, Any]] = {}
-                raw_list: List[Dict[str, Any]] = []
-                for ap in ch.get("assetPositions") or []:
-                    pos = (ap or {}).get("position") or {}
-                    if not pos:
-                        continue
-                    raw_list.append(pos)
-                    coin_raw = str(pos.get("coin") or "")
-                    coin_upper = coin_raw.upper()
-                    if coin_upper:
-                        try:
-                            norm = self._normalize_position(pos)
-                            # [ADD] 기존 대문자 키
-                            norm_map[coin_upper] = norm  # comment: 기존 동작 유지
-                            # [ADD] HIP-3 호환: 원문 키도 함께 저장해 조회 경로 다양성 보장
-                            if ":" in coin_raw:
-                                norm_map[coin_raw] = norm  # comment: 'xyz:XYZ100' 같은 원문 키 추가
-                        except Exception:
-                            continue
-                self.web3_positions_by_dex_raw[dex_key] = raw_list
-                self.web3_positions_by_dex_norm[dex_key] = norm_map
-
-                # 자산 컨텍스트(raw 리스트 그대로 저장)
-                asset_ctxs = st.get("assetCtxs") or []
-                if isinstance(asset_ctxs, list):
-                    self.web3_asset_ctxs_by_dex[dex_key] = asset_ctxs
-
-        except Exception as e:
-            ws_logger.debug(f"[webData3] update error: {e}", exc_info=True)
-
-    def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        webData3.clearinghouseState.assetPositions[*].position → 표준화 dict
-        반환 키:
-        - coin: str
-        - size: float(절대값), side: 'long'|'short'
-        - entry_px, position_value, upnl, roe, liq_px, margin_used: float|None
-        - lev_type: 'cross'|'isolated'|..., lev_value: int|None, max_leverage: int|None
-        """
-        def f(x, default=None):
-            try:
-                return float(x)
-            except Exception:
-                return default
-        coin = str(pos.get("coin") or "").upper()
-        szi = f(pos.get("szi"), 0.0) or 0.0
-        side = "long" if szi > 0 else ("short" if szi < 0 else "flat")
-        lev = pos.get("leverage") or {}
-        lev_type = str(lev.get("type") or "").lower() or None
-        try:
-            lev_value = int(float(lev.get("value"))) if lev.get("value") is not None else None
-        except Exception:
-            lev_value = None
-        return {
-            "coin": coin,
-            "size": abs(float(szi)),
-            "side": side,
-            "entry_px": f(pos.get("entryPx"), None),
-            "position_value": f(pos.get("positionValue"), None),
-            "upnl": f(pos.get("unrealizedPnl"), None),
-            "roe": f(pos.get("returnOnEquity"), None),
-            "liq_px": f(pos.get("liquidationPx"), None),
-            "margin_used": f(pos.get("marginUsed"), None),
-            "lev_type": lev_type,
-            "lev_value": lev_value,
-            "max_leverage": (int(float(pos.get("maxLeverage"))) if pos.get("maxLeverage") is not None else None),
-            "raw": pos,  # 원본도 보관(디버깅/확장용)
-        }
-
-    # [추가] 정규화 포지션 전체 반환(사본)
-    def get_positions(self) -> Dict[str, Dict[str, Any]]:
-        return dict(self.web3_positions_norm)
-
-    # [추가] 단일 코인의 핵심 요약 반환(사이즈=0 이면 None)
-    def get_position_simple(self, coin: str) -> Optional[tuple]:
-        """
-        반환: (side, size, entry_px, upnl, roe, lev_type, lev_value)
-        없거나 size=0이면 None
-        """
-        p = self.web3_positions_norm.get(coin.upper())
-        if not p or not p.get("size"):
-            return None
-        return (
-            p.get("side"),
-            float(p.get("size") or 0.0),
-            p.get("entry_px"),
-            p.get("upnl"),
-            p.get("roe"),
-            p.get("lev_type"),
-            p.get("lev_value"),
-        )
+    @property
+    def connected(self) -> bool:
+        return self.conn is not None
     
-    def get_account_value(self) -> Optional[float]:
-        return self.web3_margin.get("accountValue")
-
-    def get_withdrawable(self) -> Optional[float]:
-        return self.web3_margin.get("withdrawable")
-
-    def get_collateral_quote(self) -> Optional[str]:
-        return self.web3_collateral_quote
-
-    def get_perp_ctx(self, coin: str) -> Optional[Dict[str, Any]]:
-        return self.web3_asset_ctxs.get(coin.upper())
-
-    def get_perp_sz_decimals(self, coin: str) -> Optional[int]:
-        meta = self.web3_perp_meta.get(coin.upper())
-        return meta.get("szDecimals") if meta else None
-
-    def get_perp_max_leverage(self, coin: str) -> Optional[int]:
-        meta = self.web3_perp_meta.get(coin.upper())
-        return meta.get("maxLeverage") if meta else None
-
-    def get_position(self, coin: str) -> Optional[Dict[str, Any]]:
-        return self.web3_positions.get(coin.upper())
-
-    def get_spot_balance(self, token: str) -> float:
-        return float(self.web3_spot_balances.get(token.upper(), 0.0))
-
-    def get_spot_pair_px(self, pair: str) -> Optional[float]:
-        """
-        스팟 페어 가격 조회(내부 캐시 기반, 우선순위):
-        1) web3_spot_pair_ctxs['BASE/QUOTE']의 midPx → markPx → prevDayPx
-        2) spot_pair_prices['BASE/QUOTE'] (allMids로부터 받은 숫자)
-        3) 페어가 BASE/USDC이면 spot_prices['BASE'] (allMids에서 받은 BASE 단가)
-        """
-        if not pair:
-            return None
-        p = str(pair).strip().upper()
-
-        # 1) webData2/3에서 온 페어 컨텍스트가 있으면 거기서 mid/mark/prev 순으로 사용
-        ctx = self.web3_spot_pair_ctxs.get(p)
-        if isinstance(ctx, dict):
-            for k in ("midPx", "markPx", "prevDayPx"):
-                v = ctx.get(k)
-                if v is not None:
-                    try:
-                        return float(v)
-                    except Exception:
-                        continue
-
-        # 2) allMids에서 유지하는 페어 가격 맵(숫자) 사용
-        v = self.spot_pair_prices.get(p)
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                pass
-
-        # 3) BASE/USDC인 경우 BASE 단가(spot_prices['BASE'])를 사용
-        if p.endswith("/USDC") and "/" in p:
-            base = p.split("/", 1)[0].strip().upper()
-            v2 = self.spot_prices.get(base)
-            if v2 is not None:
-                try:
-                    return float(v2)
-                except Exception:
-                    pass
-
-        return None
-
-    def get_spot_px_base(self, base: str) -> Optional[float]:
-        return self.web3_spot_base_px.get(base.upper())
-
-    def get_open_orders(self) -> List[Dict[str, Any]]:
-        return list(self.web3_open_orders)
-
-    def set_spot_log_level(self, level: int | str) -> None:
-        """
-        level 예:
-          - 숫자: logging.WARNING, ws_logger.ERROR 등
-          - 문자열: 'WARNING', 'ERROR', 'INFO', 'DEBUG'
-        """
-        if isinstance(level, str):
-            try:
-                lvl = getattr(logger, level.upper())
-            except Exception:
-                lvl = logging.INFO
+    async def ensure_connected_and_subscribed(self) -> None:
+        if not self.connected:
+            await self.connect()
+            await self.subscribe()
         else:
-            lvl = int(level)
-        self.spot_log_min_level = lvl
+            # 이미 연결되어 있으면 누락 구독 재보장
+            await self.ensure_core_subs()
 
-    # [추가] 디버깅 로그 헬퍼
-    def _spot_log_idx(self, idx: int, level: int, msg: str):
-        # 최소 레벨 미만이면 즉시 차단
-        if level < self.spot_log_min_level:
-            return
-        c = self._spot_log_hits_idx.get(idx, 0) + 1
-        self._spot_log_hits_idx[idx] = c
-        if idx in self.debug_spot_indexes or c in (1, 10, 50) or (c % 100 == 0):
-            ws_logger.log(level, f"[spot:@{idx}] {msg}")
+    async def ensure_allmids_for(self, dex: Optional[str]) -> None:
+        """
+        하나의 WS 커넥션에서 여러 DEX allMids를 구독할 수 있게 한다.
+        - dex=None 또는 'hl' → {"type":"allMids"}
+        - 그 외 → {"type":"allMids","dex": "<dex>"}
+        중복 구독은 내부 dedup으로 자동 방지.
+        """
+        key = None
+        if dex is None or str(dex).lower() == "hl":
+            sub = {"type": "allMids"}
+            key = _sub_key(sub)
+            if key not in self._active_subs:
+                await self._send_subscribe(sub)
+        else:
+            d = str(dex).lower().strip()
+            sub = {"type": "allMids", "dex": d}
+            key = _sub_key(sub)
+            if key not in self._active_subs:
+                await self._send_subscribe(sub)
 
-    def _spot_log_pair(self, pair: str, level: int, msg: str):
-        # 최소 레벨 미만이면 즉시 차단
-        if level < self.spot_log_min_level:
-            return
-        c = self._spot_log_hits_pair.get(pair, 0) + 1
-        self._spot_log_hits_pair[pair] = c
-        base = pair.split("/", 1)[0] if "/" in pair else pair
-        if base in self.debug_spot_bases or c in (1, 10, 50) or (c % 100 == 0):
-            ws_logger.log(level, f"[spot:{pair}] {msg}")
-
-    def _log_spot_map_state(self, stage: str):
-        ws_logger.info(
-            f"[spotMeta/{stage}] tokenMap={len(self.spot_index_to_name)} "
-            f"pairMap={len(self.spot_asset_index_to_pair)} "
-            f"pending_token_idx={len(self._pending_spot_token_mids)} "
-            f"pending_pair_idx={len(self._pending_spot_pair_mids)}"
-        )
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            ws_logger.debug(f"[spotMeta/{stage}] token idx->name sample={_sample_items(self.spot_index_to_name,8)}")
-            ws_logger.debug(f"[spotMeta/{stage}] pair  idx->name sample={_sample_items(self.spot_asset_index_to_pair,8)}")
-            if self._pending_spot_token_mids:
-                ws_logger.debug(f"[spotMeta/{stage}] pending token mids sample={_sample_items(self._pending_spot_token_mids,8)}")
-            if self._pending_spot_pair_mids:
-                ws_logger.debug(f"[spotMeta/{stage}] pending pair mids  sample={_sample_items(self._pending_spot_pair_mids,8)}")
-
-    # ---------------------- REST: spotMeta ----------------------
     async def ensure_spot_token_map_http(self) -> None:
         """
         REST info(spotMeta)를 통해
@@ -599,10 +239,6 @@ class HLWSClientRaw:
         - 스팟 페어 인덱스(spotInfo.index) <-> 'BASE/QUOTE' 및 (BASE, QUOTE) 맵
         을 1회 로드/갱신한다.
         """
-        if self.spot_index_to_name and self.spot_asset_index_to_pair:
-            self._log_spot_map_state("cached")
-            return
-
         url = f"{self.http_base}/info"
         payload = {"type": "spotMeta"}
         headers = {"Content-Type": "application/json"}
@@ -722,49 +358,337 @@ class HLWSClientRaw:
             self.spot_asset_index_to_bq = bq_by_index
             ws_logger.info(f"[spotMeta] loaded spot pairs={ok} (fail={fail})")
 
-            if logging.getLogger().isEnabledFor(logging.DEBUG):
-                sample_pairs = list(pair_by_index.items())[:10]
-                sample_bq = [(k, bq_by_index[k]) for k, _ in sample_pairs if k in bq_by_index]
-                ws_logger.debug(f"[spotMeta] pair idx->name sample={sample_pairs}")
-                ws_logger.debug(f"[spotMeta] pair idx->(base,quote) sample={sample_bq}")
-
-            # 3) 보류분 소급 적용 — 페어 인덱스(@{pairIdx})
-            if self._pending_spot_pair_mids:
-                applied = 0
-                for s_idx, px in list(self._pending_spot_pair_mids.items()):
-                    pair = pair_by_index.get(s_idx)
-                    bq = bq_by_index.get(s_idx)
-                    if pair and bq:
-                        self.spot_pair_prices[pair] = float(px)
-                        base, quote = bq
-                        if quote == "USDC":
-                            self.spot_prices[base] = float(px)
-                        if logging.getLogger().isEnabledFor(logging.DEBUG):
-                            ws_logger.debug(f"[spotMeta] apply pending @{s_idx} -> {pair} ({base}/{quote}) px={px}")
-                        self._pending_spot_pair_mids.pop(s_idx, None)
-                        applied += 1
-                if applied:
-                    ws_logger.info(f"[spotMeta] applied pending pair mids: {applied}")
-
-            # (참고) 토큰 인덱스 보류분이 있을 경우 보조 적용
-            if self._pending_spot_token_mids:
-                applied_t = 0
-                for t_idx, px in list(self._pending_spot_token_mids.items()):
-                    name = idx2name.get(t_idx)
-                    if name:
-                        old = self.spot_prices.get(name)
-                        self.spot_prices[name] = float(px)
-                        ws_logger.info(f"[spotMeta] apply pending token @{t_idx} -> {name} {old} -> {px}")
-                        self._pending_spot_token_mids.pop(t_idx, None)
-                        applied_t += 1
-                if applied_t:
-                    ws_logger.info(f"[spotMeta] applied pending token mids: {applied_t}")
-
-            self._log_spot_map_state("ready")
-
         except Exception as e:
             ws_logger.warning(f"[spotMeta] parse error: {e}", exc_info=True)
-    # ---------------------- 연결/구독 ----------------------
+
+    async def _send_subscribe(self, sub: dict) -> None:
+        """subscribe 메시지 전송(중복 방지)."""
+        key = _sub_key(sub)
+        if key in self._active_subs:
+            return
+        async with self._send_lock:
+            if key in self._active_subs:
+                return
+            payload = {"method": "subscribe", "subscription": sub}
+            await self.conn.send(json.dumps(payload, separators=(",", ":")))
+            self._active_subs.add(key)
+
+    async def ensure_core_subs(self) -> None:
+        """
+        스코프별 필수 구독을 보장:
+        - allMids: 가격(이 스코프 문맥)
+        - webData3/spotState: 주소가 있을 때만
+        """
+        # 1) 가격(스코프별)
+        if self.dex:
+            await self._send_subscribe({"type": "allMids", "dex": self.dex})
+        else:
+            await self._send_subscribe({"type": "allMids"})
+        # 2) 주소 구독(webData3/spotState)
+        if self.address:
+            await self._send_subscribe({"type": "webData3", "user": self.address})
+            await self._send_subscribe({"type": "spotState", "user": self.address})
+
+    async def ensure_subscribe_active_asset(self, coin: str) -> None:
+        """
+        필요 시 코인 단위 포지션 스트림까지 구독(선택).
+        보통 webData3로 충분하므로 기본은 호출 필요 없음.
+        """
+        sub = {"type": "activeAssetData", "coin": coin}
+        if self.address:
+            sub["user"] = self.address
+        await self._send_subscribe(sub)
+
+    @staticmethod
+    def discover_perp_dexs_http(http_base: str, timeout: float = 8.0) -> list[str]:
+        """
+        POST {http_base}/info {"type":"perpDexs"} → [{'name':'xyz'}, {'name':'flx'}, ...]
+        반환: ['xyz','flx','vntl', ...] (소문자)
+        """
+        url = f"{http_base.rstrip('/')}/info"
+        payload = {"type":"perpDexs"}
+        headers = {"Content-Type": "application/json"}
+        def _post():
+            data = json_dumps(payload).encode("utf-8")
+            req = urllib_request.Request(url, data=data, headers=headers, method="POST")
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        try:
+            resp = _post()
+            out = []
+            if isinstance(resp, list):
+                for e in resp:
+                    n = (e or {}).get("name")
+                    if n:
+                        out.append(str(n).lower())
+            # 중복 제거/정렬
+            return sorted(set(out))
+        except (HTTPError, URLError):
+            return []
+        except Exception:
+            return []
+        
+    def _dex_key_by_index(self, i: int) -> str:
+        """perpDexStates 배열 인덱스를 DEX 키로 매핑. 부족하면 'dex{i}' 사용."""
+        return self.dex_keys[i] if 0 <= i < len(self.dex_keys) else f"dex{i}"
+
+    def set_dex_order(self, order: List[str]) -> None:
+        """DEX 표시 순서를 사용자 정의로 교체. 예: ['hl','xyz','flx','vntl']"""
+        try:
+            ks = [str(k).lower().strip() for k in order if str(k).strip()]
+            if ks:
+                self.dex_keys = ks
+        except Exception:
+            pass
+
+    def get_dex_keys(self) -> List[str]:
+        """현재 스냅샷에 존재하는 DEX 키(순서 보장)를 반환."""
+        present = [k for k in self.dex_keys if k in self.margin_by_dex]
+        # dex_keys 외의 임시 dex{i}가 있을 수 있으므로 뒤에 덧붙임
+        extras = [k for k in self.margin_by_dex.keys() if k not in present]
+        return present + sorted(extras)
+
+    def get_total_account_value_web3(self) -> float:
+        """webData3 기준 전체 AV 합계."""
+        try:
+            return float(sum(float((v or {}).get("accountValue", 0.0)) for v in self.margin_by_dex.values()))
+        except Exception:
+            return 0.0
+
+    def get_account_value_by_dex(self, dex: Optional[str] = None) -> Optional[float]:
+        d = self.margin_by_dex.get((dex or "hl").lower())
+        if not d: return None
+        try: return float(d.get("accountValue"))
+        except Exception: return None
+
+    def get_withdrawable_by_dex(self, dex: Optional[str] = None) -> Optional[float]:
+        d = self.margin_by_dex.get((dex or "hl").lower())
+        if not d: return None
+        try: return float(d.get("withdrawable"))
+        except Exception: return None
+
+    def get_margin_summary_by_dex(self, dex: Optional[str] = None) -> Dict[str, float]:
+        return dict(self.margin_by_dex.get((dex or "hl").lower(), {}))
+
+    def get_positions_by_dex(self, dex: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        return dict(self.positions_by_dex_norm.get((dex or "hl").lower(), {}))
+
+    def get_asset_ctxs_by_dex(self, dex: Optional[str] = None) -> List[Dict[str, Any]]:
+        return list(self.asset_ctxs_by_dex.get((dex or "hl").lower(), []))
+
+    def _update_from_webData3(self, data: Dict[str, Any]) -> None:
+        """
+        webData3 포맷을 DEX별로 분리 파싱해 내부 캐시에 반영.
+        data 구조:
+        - userState: {...}
+        - perpDexStates: [ { clearinghouseState, assetCtxs, ...}, ... ]  # HL, xyz, flx, vntl 순
+        """
+        try:
+            # userState(참고/보조)
+            user_state = data.get("userState") or {}
+            
+            self.server_time = user_state.get("serverTime") or self.server_time
+            if user_state.get("user"):
+                self.agent["user"] = user_state.get("user")
+            if user_state.get("agentAddress"):
+                self.agent["agentAddress"] = user_state["agentAddress"]
+            if user_state.get("agentValidUntil"):
+                self.agent["agentValidUntil"] = user_state["agentValidUntil"]
+            
+            dex_states = data.get("perpDexStates") or []
+            
+            # 누적 합계 재계산
+            self.total_account_value = 0.0
+
+
+            for i, st in enumerate(dex_states):
+                dex_key = self._dex_key_by_index(i)
+                ch = (st or {}).get("clearinghouseState") or {}
+                ms = ch.get("marginSummary") or {}
+
+                # 숫자 변환
+                def fnum(x, default=0.0):
+                    try: return float(x)
+                    except Exception: return default
+
+                margin = {
+                    "accountValue": fnum(ms.get("accountValue")),
+                    "totalNtlPos":  fnum(ms.get("totalNtlPos")),
+                    "totalRawUsd":  fnum(ms.get("totalRawUsd")),
+                    "totalMarginUsed": fnum(ms.get("totalMarginUsed")),
+                    "crossMaintenanceMarginUsed": fnum(ch.get("crossMaintenanceMarginUsed")),
+                    "withdrawable": fnum(ch.get("withdrawable")),
+                    "time": ch.get("time"),
+                }
+                self.margin_by_dex[dex_key] = margin
+                self.total_account_value += float(margin["accountValue"])
+
+                # 포지션(정규화/원본)
+                norm_map: Dict[str, Dict[str, Any]] = {}
+                raw_list: List[Dict[str, Any]] = []
+                for ap in ch.get("assetPositions") or []:
+                    pos = (ap or {}).get("position") or {}
+                    if not pos:
+                        continue
+                    raw_list.append(pos)
+                    coin_raw = str(pos.get("coin") or "")
+                    coin_upper = coin_raw.upper()
+                    if coin_upper:
+                        try:
+                            norm = self._normalize_position(pos)
+                            # [ADD] 기존 대문자 키
+                            norm_map[coin_upper] = norm  # comment: 기존 동작 유지
+                            # [ADD] HIP-3 호환: 원문 키도 함께 저장해 조회 경로 다양성 보장
+                            if ":" in coin_raw:
+                                norm_map[coin_raw] = norm  # comment: 'xyz:XYZ100' 같은 원문 키 추가
+                        except Exception:
+                            continue
+                self.positions_by_dex_raw[dex_key] = raw_list
+                self.positions_by_dex_norm[dex_key] = norm_map
+
+                # 자산 컨텍스트(raw 리스트 그대로 저장)
+                asset_ctxs = st.get("assetCtxs") or []
+                if isinstance(asset_ctxs, list):
+                    self.asset_ctxs_by_dex[dex_key] = asset_ctxs
+
+        except Exception as e:
+            ws_logger.debug(f"[webData3] update error: {e}", exc_info=True)
+
+    def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        webData3.clearinghouseState.assetPositions[*].position → 표준화 dict
+        반환 키:
+        - coin: str
+        - size: float(절대값), side: 'long'|'short'
+        - entry_px, position_value, upnl, roe, liq_px, margin_used: float|None
+        - lev_type: 'cross'|'isolated'|..., lev_value: int|None, max_leverage: int|None
+        """
+        def f(x, default=None):
+            try:
+                return float(x)
+            except Exception:
+                return default
+        coin = str(pos.get("coin") or "").upper()
+        szi = f(pos.get("szi"), 0.0) or 0.0
+        side = "long" if szi > 0 else ("short" if szi < 0 else "flat")
+        lev = pos.get("leverage") or {}
+        lev_type = str(lev.get("type") or "").lower() or None
+        try:
+            lev_value = int(float(lev.get("value"))) if lev.get("value") is not None else None
+        except Exception:
+            lev_value = None
+        return {
+            "coin": coin,
+            "size": abs(float(szi)),
+            "side": side,
+            "entry_px": f(pos.get("entryPx"), None),
+            "position_value": f(pos.get("positionValue"), None),
+            "upnl": f(pos.get("unrealizedPnl"), None),
+            "roe": f(pos.get("returnOnEquity"), None),
+            "liq_px": f(pos.get("liquidationPx"), None),
+            "margin_used": f(pos.get("marginUsed"), None),
+            "lev_type": lev_type,
+            "lev_value": lev_value,
+            "max_leverage": (int(float(pos.get("maxLeverage"))) if pos.get("maxLeverage") is not None else None),
+            "raw": pos,  # 원본도 보관(디버깅/확장용)
+        }
+
+    # [추가] 정규화 포지션 전체 반환(사본)
+    def get_positions(self) -> Dict[str, Dict[str, Any]]:
+        return dict(self.positions_norm)
+
+    # [추가] 단일 코인의 핵심 요약 반환(사이즈=0 이면 None)
+    def get_position_simple(self, coin: str) -> Optional[tuple]:
+        """
+        반환: (side, size, entry_px, upnl, roe, lev_type, lev_value)
+        없거나 size=0이면 None
+        """
+        p = self.positions_norm.get(coin.upper())
+        if not p or not p.get("size"):
+            return None
+        return (
+            p.get("side"),
+            float(p.get("size") or 0.0),
+            p.get("entry_px"),
+            p.get("upnl"),
+            p.get("roe"),
+            p.get("lev_type"),
+            p.get("lev_value"),
+        )
+    
+    def get_account_value(self) -> Optional[float]:
+        return self.margin.get("accountValue")
+
+    def get_withdrawable(self) -> Optional[float]:
+        return self.margin.get("withdrawable")
+
+    def get_collateral_quote(self) -> Optional[str]:
+        return self.collateral_quote
+
+    def get_perp_ctx(self, coin: str) -> Optional[Dict[str, Any]]:
+        return self.asset_ctxs.get(coin.upper())
+
+    def get_perp_sz_decimals(self, coin: str) -> Optional[int]:
+        meta = self.perp_meta.get(coin.upper())
+        return meta.get("szDecimals") if meta else None
+
+    def get_perp_max_leverage(self, coin: str) -> Optional[int]:
+        meta = self.perp_meta.get(coin.upper())
+        return meta.get("maxLeverage") if meta else None
+
+    def get_position(self, coin: str) -> Optional[Dict[str, Any]]:
+        return self.positions.get(coin.upper())
+
+    def get_spot_balance(self, token: str) -> float:
+        return float(self.balances.get(token.upper(), 0.0))
+
+    def get_spot_pair_px(self, pair: str) -> Optional[float]:
+        """
+        스팟 페어 가격 조회(내부 캐시 기반, 우선순위):
+        1) spot_pair_ctxs['BASE/QUOTE']의 midPx → markPx → prevDayPx
+        2) spot_pair_prices['BASE/QUOTE'] (allMids로부터 받은 숫자)
+        3) 페어가 BASE/USDC이면 spot_prices['BASE'] (allMids에서 받은 BASE 단가)
+        """
+        if not pair:
+            return None
+        p = str(pair).strip().upper()
+
+        # 1) webData2/3에서 온 페어 컨텍스트가 있으면 거기서 mid/mark/prev 순으로 사용
+        ctx = self.spot_pair_ctxs.get(p)
+        if isinstance(ctx, dict):
+            for k in ("midPx", "markPx", "prevDayPx"):
+                v = ctx.get(k)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except Exception:
+                        continue
+
+        # 2) allMids에서 유지하는 페어 가격 맵(숫자) 사용
+        v = self.spot_pair_prices.get(p)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+
+        # 3) BASE/USDC인 경우 BASE 단가(spot_prices['BASE'])를 사용
+        if p.endswith("/USDC") and "/" in p:
+            base = p.split("/", 1)[0].strip().upper()
+            v2 = self.spot_prices.get(base)
+            if v2 is not None:
+                try:
+                    return float(v2)
+                except Exception:
+                    pass
+
+        return None
+
+    def get_spot_px_base(self, base: str) -> Optional[float]:
+        return self.spot_base_px.get(base.upper())
+
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        return list(self.open_orders)
 
     async def connect(self) -> None:
         ws_logger.info(f"WS connect: {self.ws_url}")
@@ -803,8 +727,7 @@ class HLWSClientRaw:
     def _update_spot_balances(self, balances_list: Optional[List[Dict[str, Any]]]) -> None:
         """
         balances_list: [{'coin':'USDC','token':0,'total':'88.2969',...}, ...]
-        - web3_spot_balances[token_name] 갱신
-        - 레거시 self.balances도 동일 키로 동기화
+        - balances[token_name] 갱신
         """
         if not isinstance(balances_list, list):
             return
@@ -815,8 +738,6 @@ class HLWSClientRaw:
                 if not token_name:
                     continue
                 total = float(b.get("total") or 0.0)
-                self.web3_spot_balances[token_name] = total
-                # 레거시 캐시도 함께 유지(하위 호환)
                 self.balances[token_name] = total
                 updated += 1
             except Exception:
@@ -923,9 +844,7 @@ class HLWSClientRaw:
 
         if ch == "allMids":
             data = msg.get("data") or {}
-            if self.log_raw_allmids and logging.getLogger().isEnabledFor(logging.DEBUG):
-                ws_logger.debug(f"[allMids/raw] keys={len((data.get('mids') or {}).keys())}")
-
+            
             if isinstance(data, dict) and isinstance(data.get("mids"), dict):
                 mids: Dict[str, Any] = data["mids"]
                 n_pair = n_pair_text = n_perp = 0
@@ -941,12 +860,9 @@ class HLWSClientRaw:
 
                         pair_name = self.spot_asset_index_to_pair.get(pair_idx)   # 'BASE/QUOTE'
                         bq_tuple  = self.spot_asset_index_to_bq.get(pair_idx)     # (BASE, QUOTE)
-                        asset_id  = 10000 + pair_idx                               # 공식: spot asset id
 
                         if not pair_name or not bq_tuple:
                             # 페어 맵 미준비 → 보류
-                            self._pending_spot_pair_mids[pair_idx] = px
-                            self._spot_log_idx(pair_idx, logging.DEBUG, f"pending pair map (px={px})")
                             continue
 
                         base, quote = bq_tuple
@@ -957,7 +873,6 @@ class HLWSClientRaw:
                         # 1-2) 쿼트가 USDC인 경우 base 단일 가격도 채움
                         if quote == "USDC":
                             self.spot_prices[base] = px
-                            
 
                         n_pair += 1
                         continue
@@ -990,10 +905,6 @@ class HLWSClientRaw:
                     self.prices[perp_key] = px
                     n_perp += 1
 
-                if logging.getLogger().isEnabledFor(logging.DEBUG):
-                    ws_logger.debug(f"[allMids] counts: pairIdx={n_pair}, spot_text={n_pair_text}, perp={n_perp}")
-            else:
-                ws_logger.debug(f"[allMids] unexpected payload shape: {type(data)}")
             return
 
         # 포지션(코인별)
@@ -1004,77 +915,12 @@ class HLWSClientRaw:
             balances_list = spot.get("balances") or []
             self._update_spot_balances(balances_list)
 
-            # 짧은 요약 로그
-            if logging.getLogger().isEnabledFor(logging.INFO):
-                n = len(balances_list) if isinstance(balances_list, list) else 0
-                sample = None
-                try:
-                    for b in balances_list:
-                        if str(b.get("coin") or "").upper() in ("USDC","USDH"):
-                            sample = (b.get("coin"), b.get("total")); break
-                    if not sample and n:
-                        sample = (balances_list[0].get("coin"), balances_list[0].get("total"))
-                except Exception:
-                    pass
-                
             return
             
         # 유저 스냅샷(잔고 등)
         elif ch == "webData3":
-            
             data_body = msg.get("data") or {}
-            
             self._update_from_webData3(data_body)
-
-            if logging.getLogger().isEnabledFor(logging.NOTSET):
-                def _fmt_num(v, nd=4):
-                    try:
-                        f = float(v)
-                        return f"{f:.{nd}f}"
-                    except Exception:
-                        return "N/A"
-
-                def _fmt_pos_short(coin: str, p: Dict[str, Any]) -> str:
-                    side = p.get("side") or "flat"
-                    side_c = "L" if side == "long" else ("S" if side == "short" else "-")
-                    size = p.get("size") or 0.0
-                    upnl = p.get("upnl")
-                    try:
-                        upnl_s = f"{float(upnl):+.3f}" if upnl is not None else "+0.000"
-                    except Exception:
-                        upnl_s = "+0.000"
-                    # 예: BTC L0.001(+0.359)
-                    return f"{coin} {side_c}{size:g}({upnl_s})"
-
-                total_av = self.get_total_account_value_web3()
-                dex_logs = []
-                for dex_key in self.get_dex_keys():
-                    av_k = self.get_account_value_by_dex(dex_key)
-                    wd_k = self.get_withdrawable_by_dex(dex_key)
-
-                    # 포지션 요약(상위 최대 2개, 나머지는 +N 표기)
-                    pos_map = self.get_positions_by_dex(dex_key) or {}
-                    if pos_map:
-                        items = list(pos_map.items())
-                        show = []
-                        for coin, pos_norm in items[:2]:
-                            show.append(_fmt_pos_short(coin, pos_norm))
-                        if len(items) > 2:
-                            show.append(f"+{len(items)-2}")
-                        pos_str = ", ".join(show)
-                    else:
-                        pos_str = "-"
-
-                    dex_logs.append(
-                        f"\n\t\t{dex_key}:{_fmt_num(av_k)} pos={pos_str}"
-                        if (av_k is not None and wd_k is not None)
-                        else f"{dex_key}:N/A pos={pos_str}"
-                    )
-
-                ws_logger.info(f"[webData3] totalAV={_fmt_num(total_av, nd=6)} | " + " | ".join(dex_logs))
-
-        else:
-            ws_logger.debug(f"[{ch}] {str(msg)[:300]}")
 
     async def _handle_disconnect(self) -> None:
         await self._safe_close_only()
@@ -1097,35 +943,7 @@ class HLWSClientRaw:
                 await self.resubscribe()
                 return
             except Exception as e:
-                ws_logger.warning(f"reconnect failed: {e}")
                 delay = min(RECONNECT_MAX, delay * 2.0) + random.uniform(0.0, 0.5)
-
-    # ---------------------- 유틸/스냅샷/쿼리 ----------------------
-
-    def snapshot(self) -> Dict[str, Any]:
-        return {
-            "prices": dict(self.prices),
-            "spot_prices": dict(self.spot_prices),
-            "spot_pair_prices": dict(self.spot_pair_prices),
-            "positions": dict(self.positions),
-            "balances": dict(self.balances),              # 레거시
-            "spot_balances": dict(self.web3_spot_balances),  # [추가] 권장
-            "pending_spot_token_mids": dict(self._pending_spot_token_mids),
-            "pending_spot_pair_mids": dict(self._pending_spot_pair_mids),
-        }
-
-    def print_snapshot(self) -> None:
-        snap = self.snapshot()
-        ws_logger.info(
-            f"[snapshot] perp={len(snap['prices'])} "
-            f"spot_base={len(snap['spot_prices'])} "
-            f"spot_pair={len(snap['spot_pair_prices'])} "
-            f"pending_token_idx={len(snap['pending_spot_token_mids'])} "
-            f"pending_pair_idx={len(snap['pending_spot_pair_mids'])}"
-        )
-        ws_logger.info(f"[snapshot] perp(sample)={_sample_items(snap['prices'])}")
-        ws_logger.info(f"[snapshot] spot_base(sample)={_sample_items(snap['spot_prices'])}")
-        ws_logger.info(f"[snapshot] spot_pair(sample)={_sample_items(snap['spot_pair_prices'])}")
 
     def get_price(self, symbol: str) -> Optional[float]:
         """Perp/일반 심볼 가격 조회(캐시)."""
@@ -1136,7 +954,7 @@ class HLWSClientRaw:
         return self.spot_prices.get(symbol.upper())
 
     def get_all_spot_balances(self) -> Dict[str, float]:
-        return dict(self.web3_spot_balances)
+        return dict(self.balances)
 
     def get_spot_portfolio_value_usdc(self) -> float:
         """
@@ -1146,7 +964,7 @@ class HLWSClientRaw:
         - 가격을 알 수 없는 토큰은 0으로 계산
         """
         total = 0.0
-        for token, amt in self.web3_spot_balances.items():
+        for token, amt in self.balances.items():
             try:
                 if token == "USDC":
                     px = 1.0
@@ -1156,7 +974,7 @@ class HLWSClientRaw:
                     if px is None:
                         # spot_pair_ctxs에 'TOKEN/USDC'가 있으면 그 값을 사용
                         pair = f"{token}/USDC"
-                        ctx = self.web3_spot_pair_ctxs.get(pair)
+                        ctx = self.spot_pair_ctxs.get(pair)
                         if isinstance(ctx, dict):
                             for k in ("midPx","markPx","prevDayPx"):
                                 v = ctx.get(k)
@@ -1172,102 +990,230 @@ class HLWSClientRaw:
                 continue
         return float(total)
 
-# ---------------------- CLI/메인 ----------------------
 
-def _parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Hyperliquid WS raw client (no SDK)")
-    p.add_argument("--base", type=str, default=DEFAULT_HTTP_BASE,
-                   help="API base URL (https를 wss로 자동 변환). 기본: https://api.hyperliquid.xyz")
-    p.add_argument("--dex", type=str, default=os.environ.get("HL_DEX", ""),
-                   help="dex (xyz, flx, vntl) 필요시, 없으면 생략")
-    p.add_argument("--address", type=str, default=os.environ.get("HL_ADDRESS", ""),
-                   help="지갑 주소(0x...). 없으면 유저 전용 구독은 생략")
-    p.add_argument("--coins", type=str, default=os.environ.get("HL_COINS", "BTC"),
-                   help="activeAssetData 구독할 코인 목록 CSV (기본: BTC)")
-    p.add_argument("--log", type=str, default=os.environ.get("HL_LOG", "INFO"),
-                   help="로그 레벨 (DEBUG/INFO/WARNING/ERROR)")
-    p.add_argument("--duration", type=int, default=int(os.environ.get("HL_DURATION", "0")),
-                   help="N초 동안만 실행 후 종료(0=무한)")
-    p.add_argument("--debug-spot-indexes", type=str, default="", help="집중 로그할 spotInfo index CSV (예: 0,142)")
-    p.add_argument("--debug-spot-bases", type=str, default="", help="집중 로그할 BASE 심볼 CSV (예: BTC,ETH,PURR)")
-    p.add_argument("--log-raw-allmids", action="store_true", help="allMids 원시 키 개수 DEBUG 출력")
-    # [추가] spot 전용 로그 최소 레벨(기본은 코드에서 WARNING으로 셋)
-    p.add_argument("--spot-log-level", type=str, default=os.environ.get("HL_SPOT_LOG_LEVEL", ""),
-                   help="spot 로그 최소 레벨 설정 (DEBUG/INFO/WARNING/ERROR). 기본: WARNING")
-    return p.parse_args(argv)
+class HLWSClientPool:
+    """
+    (ws_url, address) 단위로 HLWSClientRaw를 1개만 생성/공유하는 풀.
+    - 동일 주소에서 다중 DEX allMids는 하나의 커넥션에서 추가 구독한다.
+    - address가 None/""이면 '가격 전용' 공유 커넥션으로 취급(유저 스트림 없음).
+    """
+    def __init__(self) -> None:
+        self._clients: dict[str, HLWSClientRaw] = {}
+        self._refcnt: dict[str, int] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
-async def _amain(args: argparse.Namespace) -> int:
-    # 1) 원하는 최소 출력 레벨 지정(여기서는 WARNING 이상만)
-    target_level = logging.INFO
+    def _key(self, ws_url: str, address: Optional[str]) -> str:
+        addr = (address or "").lower().strip()
+        url = http_to_wss(ws_url) if ws_url.startswith("http") else ws_url
+        return f"{url}|{addr}"
 
-    # 2) 루트 로거 강제 재구성(force=True). (Py>=3.8)
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+
+    async def acquire(
+        self,
+        *,
+        ws_url: str,
+        http_base: str,
+        address: Optional[str],
+        dex: Optional[str] = None,
+    ) -> HLWSClientRaw:
+        """
+        풀에서 (ws_url,address) 키로 클라이언트를 획득(없으면 생성).
+        생성 시:
+          - spotMeta 선행 로드
+          - connect + 기본 subscribe(webData3/spotState는 address가 있을 때만)
+        이후 요청된 dex의 allMids를 추가 구독.
+        """
+        key = self._key(ws_url, address)
+        lock = self._get_lock(key)
+        async with lock:
+            client = self._clients.get(key)
+            if client is None:
+                # [ADDED] 최초 생성: dex=None로 만들어 HL 메인 allMids만 기본 구독
+                client = HLWSClientRaw(
+                    ws_url=http_to_wss(ws_url),
+                    dex=None,                      # comment: allMids(기본, HL)만 우선
+                    address=address,
+                    coins=[],
+                    http_base=http_base,
+                )
+                await client.ensure_spot_token_map_http()
+                await client.ensure_connected_and_subscribed()
+                self._clients[key] = client
+                self._refcnt[key] = 0
+
+            # 참조 카운트 증가
+            self._refcnt[key] += 1
+
+        # 락 밖에서 dex allMids 추가 구독(중복 방지 로직 보유)
+        await client.ensure_allmids_for(dex)
+        return client
+
+    async def release(self, *, ws_url: str, address: Optional[str]) -> None:
+        key = self._key(ws_url, address)
+        lock = self._get_lock(key)
+        async with lock:
+            if key not in self._clients:
+                return
+            self._refcnt[key] = max(0, self._refcnt.get(key, 1) - 1)
+            if self._refcnt[key] == 0:
+                client = self._clients.pop(key)
+                self._refcnt.pop(key, None)
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                # 락은 재사용 가능하므로 남겨둠
+
+WS_POOL = HLWSClientPool()
+
+# -------------------- 메인 로직 --------------------
+
+def _fmt_num(v: Any, nd: int = 6, none: str = "-") -> str:
     try:
-        ws_logger.basicConfig(
-            level=target_level,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[ws_logger.StreamHandler(sys.stdout)],
-            force=True,  # 기존 핸들러/설정을 모두 무시하고 강제 재설정
-        )
-    except TypeError:
-        # Py<3.8 fallback: 기존 핸들러 제거 후 재설정
-        root = logging.getLogger()
-        for h in list(root.handlers):
-            root.removeHandler(h)
-        ws_logger.basicConfig(
-            level=target_level,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[ws_logger.StreamHandler(sys.stdout)],
-        )
+        f = float(v)
+        if abs(f) >= 1:
+            return f"{f:,.{max(2, min(nd, 8))}f}"
+        return f"{f:.{nd}f}"
+    except Exception:
+        return none
 
-    # 3) 전역적으로 INFO/DEBUG 비활성화 (WARNING 이상만 출력)
-    #    disable는 "이 레벨 이하"를 전부 막습니다. INFO(20) → INFO/DEBUG 차단.
-    #ws_logger.disable(logging.INFO)
-    
+def _fmt_pos_short(coin: str, p: Dict[str, Any]) -> str:
+    side = p.get("side") or "flat"
+    side_c = "L" if side == "long" else ("S" if side == "short" else "-")
+    size = p.get("size") or 0.0
+    upnl = p.get("upnl")
+    try:
+        upnl_s = f"{float(upnl):+.3f}" if upnl is not None else "+0.000"
+    except Exception:
+        upnl_s = "+0.000"
+    return f"{coin} {side_c}{size:g}({upnl_s})"
 
-    # 4) 서드파티 로거(있다면)도 WARNING 이상으로 격상
-    for name in ("websockets", "asyncio"):
-        try:
-            lg = logging.getLogger(name)
-            lg.setLevel(target_level)
-            for h in lg.handlers:
-                h.setLevel(target_level)
-        except Exception:
-            pass
-
-    # 5) 나머지 부트스트랩
-    ws_url = http_to_wss(args.base)
-    addr = args.address.strip() or None
-    dex = args.dex.strip().lower() or None
-    coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
-
-    # 아래 INFO 로그는 disable(INFO) 때문에 출력되지 않습니다.
-    ws_logger.info(f"Start WS (url={ws_url}, dex={dex} addr={addr}, coins={coins})")
-
-    client = HLWSClientRaw(ws_url=ws_url, dex=dex, address=addr, coins=coins, http_base=args.base)
-
-
-    if getattr(args, "spot_log_level", None):
-        client.set_spot_log_level(args.spot_log_level)
+def _parse_perp_arg(perp_arg: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    perp_arg가 'xyz:XYZ100' 형태면 dex를 추출(lower), 심볼은 'xyz:XYZ100'로 유지.
+    반환: (resolved_perp_symbol, resolved_dex)
+    """
+    if not perp_arg:
+        return None, None
+    s = perp_arg.strip()
+    if ":" in s:
+        dex_from_perp, coin = s.split(":", 1)
+        dex_final = dex_from_perp.strip().lower()
+        perp_final = f"{dex_final}:{coin.strip().upper()}"
+        return perp_final, dex_final
     else:
-        client.set_spot_log_level(logging.WARNING)
+        return s.upper(), None
 
-    # 선택 디버그 타깃 주입(필요 없으면 유지해도 무관)
-    if getattr(args, "debug_spot_indexes", None):
+async def _wait_for_price(client: HLWSClientRaw, symbol: str, is_spot_pair: bool = False, base_only: bool = False,
+                          timeout: float = 8.0, poll: float = 0.1) -> Optional[float]:
+    """
+    가격 대기:
+      - is_spot_pair=True       → 'BASE/USDC' 등 페어 가격
+      - base_only=True          → BASE 단가(USDC 쿼트 전제)
+      - 둘 다 False             → Perp/일반 심볼
+    """
+    end = time.time() + timeout
+    symbol_u = symbol.upper()
+    while time.time() < end:
         try:
-            client.debug_spot_indexes = {int(x.strip()) for x in args.debug_spot_indexes.split(",") if x.strip()}
+            if is_spot_pair:
+                px = client.get_spot_pair_px(symbol_u)
+                if px is not None:
+                    return px
+            elif base_only:
+                px = client.get_spot_px_base(symbol_u)
+                if px is not None:
+                    return px
+            else:
+                px = client.get_price(symbol_u)
+                if px is not None:
+                    return px
         except Exception:
             pass
-    if getattr(args, "debug_spot_bases", None):
-        client.debug_spot_bases = {x.strip().upper() for x in args.debug_spot_bases.split(",") if x.strip()}
-    client.log_raw_allmids = bool(getattr(args, "log_raw_allmids", False))
+        await asyncio.sleep(poll)
+    return None
 
+async def _wait_for_webdata3_any(clients: Dict[str, HLWSClientRaw], timeout: float = 10.0, poll: float = 0.2) -> bool:
+    """여러 client 중 하나라도 webData3(DEX별 margin/positions)를 받기까지 대기."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            for c in clients.values():
+                if getattr(c, "margin_by_dex", None):
+                    if c.margin_by_dex:
+                        return True
+        except Exception:
+            pass
+        await asyncio.sleep(poll)
+    return False
+
+def _resolve_perp_for_scope(scope: str, input_perp: str) -> str:
+    """
+    입력 perp 심볼(예: 'BTC' 또는 'xyz:XYZ100')을 scope별 쿼리 심볼로 변환.
+    - scope == 'hl' → 'COIN'
+    - scope != 'hl' → 'scope:COIN'
+    """
+    s = input_perp.strip().upper()
+    if ":" in s:
+        _, coin = s.split(":", 1)
+        base = coin.strip().upper()
+    else:
+        base = s
+    return base if scope == "hl" else f"{scope}:{base}"
+
+
+
+async def run_demo(base: str, address: Optional[str],
+                   perp_symbol: Optional[str], spot_symbol: Optional[str],
+                   interval: float, duration: int, log_level: str) -> int:
+
+    # 로깅 설정
+    lvl = getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=lvl,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
+    )
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+    # --perp 에서 DEX 자동 추출(출력 포맷 보조에만 사용)
+    perp_sym_resolved, dex_resolved = _parse_perp_arg(perp_symbol)
+
+    http_base = base.rstrip("/") if base else DEFAULT_HTTP_BASE
+    ws_host = http_to_wss(http_base)
+
+    # 1) 시작 시 DEX 목록 조회 → scope 리스트 생성
+    #dex_list = HLWSClientRaw.discover_perp_dexs_http(http_base)  # ex: ['xyz','flx','vntl']
+    scopes = [dex_resolved] if dex_resolved else ["hl"]  # 선택한 스코프만 WS 생성
+
+    # 2) scope별 WS 인스턴스 생성/구독
+    clients: Dict[str, HLWSClientRaw] = {}
+    for sc in scopes:
+        dex_sc = None if sc == "hl" else sc
+        c = HLWSClientRaw(
+            ws_url=ws_host,
+            dex=dex_sc,
+            address=address,   # 주소가 있으면 webData3/spotState 동시 구독
+            coins=[],          # activeAssetData는 생략
+            http_base=http_base
+        )
+        # spot meta 선행
+        await c.ensure_spot_token_map_http()
+        await c.connect()
+        await c.subscribe()
+        clients[sc] = c
+
+    # 종료 시그널
     stop_event = asyncio.Event()
-
     def _on_signal():
-        # WARNING 이상이므로 출력됨
-        ws_logger.warning("Signal received; shutting down...")
+        logging.warning("Signal received; shutting down...")
         stop_event.set()
-
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -1275,29 +1221,149 @@ async def _amain(args: argparse.Namespace) -> int:
         except NotImplementedError:
             pass
 
-    try:
-        await client.ensure_spot_token_map_http()
-        await client.connect()
-        await client.subscribe()
+    # webData3 준비(주소가 있으면 포지션/마진 출력용)
+    if address:
+        await _wait_for_webdata3_any(clients, timeout=10.0)
 
-        t0 = time.time()
+    # 최초 워밍업: 질문된 가격(Perp/Spot)을 한번 대기(있으면)
+    async def _warmup():
+        tasks: List[asyncio.Task] = []
+        if perp_sym_resolved:
+            #for sc in scopes:
+            sc = dex_resolved if dex_resolved else "hl"
+            sym_sc = _resolve_perp_for_scope(sc, perp_sym_resolved)
+            tasks.append(asyncio.create_task(_wait_for_price(clients[sc], symbol=sym_sc)))
+        if spot_symbol:
+            s = spot_symbol.strip().upper()
+            #for sc in scopes:
+            sc = "hl"
+            if "/" in s:
+                tasks.append(asyncio.create_task(_wait_for_price(clients[sc], symbol=s, is_spot_pair=True)))
+            else:
+                tasks.append(asyncio.create_task(_wait_for_price(clients[sc], symbol=f"{s}/USDC", is_spot_pair=True)))
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=8.0)
+            except Exception:
+                pass
+    await _warmup()
+
+    # 지속 출력 루프
+    t0 = time.time()
+    try:
         while not stop_event.is_set():
-            # INFO 레벨 → disable(INFO)로 인해 출력되지 않음
-            client.print_snapshot()
-            await asyncio.sleep(5.0)
-            if getattr(args, "duration", 0) and (time.time() - t0) >= args.duration:
-                ws_logger.info("Duration reached, exiting.")  # 이 로그도 보이지 않음
+            # 1) Perp 가격 (DEX별)
+            if perp_sym_resolved:
+                print("Perp Prices by DEX:")
+                #for sc in scopes:
+                #dex_resolved
+                sc = dex_resolved if dex_resolved else 'hl'
+                sym_sc = _resolve_perp_for_scope(sc, perp_sym_resolved)
+                px = clients[sc].get_price(sym_sc)
+                print(f"  [{sc}] {sym_sc}: {_fmt_num(px, 6)}")
+
+            # 2) Spot 가격 (DEX별)
+            if spot_symbol:
+                s_in = spot_symbol.strip().upper()
+                shown_label = s_in if "/" in s_in else f"{s_in}/USDC"
+                print("Spot Prices by DEX:")
+                sc = 'hl'
+                #for sc in scopes:
+                if "/" in s_in:
+                    px = clients[sc].get_spot_pair_px(s_in)
+                else:
+                    px = clients[sc].get_spot_pair_px(f"{s_in}/USDC")
+                    if px is None:
+                        # 대체 쿼트 후보 안내(해당 scope 캐시에서 BASE/ANY)
+                        found = None
+                        try:
+                            for k, v in clients[sc].spot_pair_prices.items():
+                                if k.startswith(f"{s_in}/"):
+                                    found = (k, float(v)); break
+                        except Exception:
+                            pass
+                        if found:
+                            print(f"  [{sc}] {shown_label}: USDC 페어 미발견 → 대체 {found[0]}={_fmt_num(found[1],8)}")
+                            continue
+                print(f"  [{sc}] {shown_label}: {_fmt_num(px, 8)}")
+
+            # 3) webData3: 마진/포지션(주소가 있을 때)
+            if address:
+                total_av = 0.0
+                print("Account Value by DEX:")
+                for sc in scopes:
+                    # 동일 주소로 각 WS가 webData3를 받으므로, 같은 값을 읽게 되지만
+                    # scope별 client에서 get_account_value_by_dex(sc)로 명시적으로 분리
+                    av_sc = clients[sc].get_account_value_by_dex(sc if sc != "hl" else "hl")
+                    total_av += float(av_sc or 0.0)
+                    print(f"  [{sc}] AV={_fmt_num(av_sc,6)}")
+
+                    pos_map = clients[sc].get_positions_by_dex(sc if sc != "hl" else "hl") or {}
+                    if not pos_map:
+                        print("    Positions: -")
+                    else:
+                        items = list(pos_map.items())
+                        show = []
+                        for coin, pos in items[:5]:
+                            show.append(_fmt_pos_short(coin, pos))
+                        if len(items) > 5:
+                            show.append(f"... +{len(items) - 5} more")
+                        print("    " + "; ".join(show))
+                print(f"Total AV (sum): {_fmt_num(total_av, 6)}")
+
+                # 4) Spot 잔고/포트폴리오
+                # (모든 scope가 동일 주소의 spotState를 구독하므로 어느 client에서 읽어도 동일)
+                any_client = next(iter(clients.values()))
+                bals = any_client.get_all_spot_balances()
+                if bals:
+                    # 상위 10개만 간단히 표시
+                    rows = sorted(bals.items(), key=lambda kv: kv[1], reverse=True)[:10]
+                    print("Spot Balances (Top by Amount): " + ", ".join([f"{t}={_fmt_num(a, 8)}" for t, a in rows]))
+                    try:
+                        pv = any_client.get_spot_portfolio_value_usdc()
+                        print(f"Spot Portfolio Value (≈USDC): {_fmt_num(pv, 6)}")
+                    except Exception:
+                        pass
+
+            print()
+            await asyncio.sleep(max(0.3, float(interval)))
+            if duration and (time.time() - t0) >= duration:
                 break
+
     finally:
-        await client.close()
+        # 모든 scope client를 정리
+        for c in clients.values():
+            try:
+                await c.close()
+            except Exception:
+                pass
 
     return 0
 
+# -------------------- CLI --------------------
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = _parse_args(argv or sys.argv[1:])
-    return asyncio.run(_amain(args))
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="HL WS Demo - Market & User (no SDK)")
+    p.add_argument("--base", type=str, default=DEFAULT_HTTP_BASE, help="API base URL (https→wss 자동). 기본: https://api.hyperliquid.xyz")
+    p.add_argument("--address", type=str, default=os.environ.get("HL_ADDRESS", ""), help="지갑 주소(0x...). 포지션/마진/스팟 잔고 표시")
+    p.add_argument("--perp", type=str, default=os.environ.get("HL_PERP", ""), help="Perp 심볼 (예: BTC 또는 xyz:XYZ100). 'dex:COIN'이면 dex 자동 추출")
+    p.add_argument("--spot", type=str, default=os.environ.get("HL_SPOT", ""), help="Spot 심볼 (예: UBTC 또는 UBTC/USDC)")
+    p.add_argument("--interval", type=float, default=3.0, help="지속 출력 주기(초)")
+    p.add_argument("--duration", type=int, default=0, help="N초 뒤 종료(0=무한)")
+    p.add_argument("--log", type=str, default=os.environ.get("HL_LOG", "INFO"), help="로그 레벨 (DEBUG/INFO/WARNING/ERROR)")
+    return p.parse_args(argv or sys.argv[1:])
 
+def main() -> int:
+    args = _parse_args()
+    return asyncio.run(run_demo(
+        base=args.base,
+        address=(args.address.strip() or None),
+        perp_symbol=(args.perp.strip() or None),
+        spot_symbol=(args.spot.strip() or None),
+        interval=float(args.interval),
+        duration=int(args.duration),
+        log_level=args.log,
+    ))
 
 if __name__ == "__main__":
     raise SystemExit(main())

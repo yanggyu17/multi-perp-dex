@@ -1,7 +1,7 @@
 from multi_perp_dex import MultiPerpDex, MultiPerpDexMixin
-from .hyperliquid_ws_client import HLWSClientRaw
+from .hyperliquid_ws_client import HLWSClientRaw, WS_POOL
 import json
-from typing import Dict
+from typing import Dict, Optional, List, Dict, Tuple
 import aiohttp
 from aiohttp import TCPConnector
 import asyncio
@@ -37,14 +37,24 @@ class HyperliquidExchange(MultiPerpDexMixin,MultiPerpDex):
             self.agent_api_private_key = agent_api_private_key
 
         self.vault_address = vault_address
-
+        
         self.http_base = BASE_URL
+        self.ws_base = BASE_WS
         self.spot_index_to_name = None
         self.spot_asset_index_to_pair = None
         self.spot_prices = None
+        self.dex_list = ["hl"] # default and add
 
         self._http =  None
+
+        # WS 관련 내부 상태
+        self.ws_client: Optional[HLWSClientRaw] = ws_client if isinstance(ws_client, HLWSClientRaw) else None
+        self._ws_owned: bool = self.ws_client is None   # comment: 풀에서 획득하면 True, 외부 주입이면 False
+        self._ws_pool_key = None                        # comment: release 시 사용
         
+        self.fetch_by_ws = fetch_by_ws
+        self.signing_method = signing_method
+
     def _session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession(
@@ -56,13 +66,38 @@ class HyperliquidExchange(MultiPerpDexMixin,MultiPerpDex):
         return self._http
     
     async def close(self):
+        # HTTP 세션 종료 + WS 풀 release
         if self._http and not self._http.closed:
             await self._http.close()
+        # 풀에서 소유한 WS만 release (외부 주입 WS는 소유권 없음)
+        if self._ws_owned and self._ws_pool_key:
+            ws_url, addr = self._ws_pool_key
+            try:
+                await WS_POOL.release(ws_url=ws_url, address=addr)
+            except Exception:
+                pass
 
     async def init(self):
-        await self.ensure_spot_token_map_http()
+        await self._init_spot_token_map() # for rest api 
+        await self._get_dex_list()
 
-    async def ensure_spot_token_map_http(self) -> None:
+    async def _get_dex_list(self):
+        url = f"{self.http_base}/info"
+        payload = {"type":"perpDexs"}
+        headers = {"Content-Type": "application/json"}
+        s = self._session()
+        async with s.post(url, json=payload, headers=headers) as r:
+            status = r.status
+            try:
+                resp = await r.json()
+            except aiohttp.ContentTypeError:
+                resp = await r.text()
+        for e in resp:
+            n = (e or{}).get("name")
+            if n:
+                self.dex_list.append(n)
+
+    async def _init_spot_token_map(self):
         """
         REST info(spotMeta)를 통해
         - 토큰 인덱스 <-> 이름(USDC, PURR, ...) 맵
@@ -176,7 +211,46 @@ class HyperliquidExchange(MultiPerpDexMixin,MultiPerpDex):
             pass
 
     async def create_ws_client(self):
-        pass
+        """
+        WS 커넥션을 '1회 연결 + 다중 구독'으로 운용.
+        - 외부 ws_client가 주어지면 그것을 사용(연결/구독 보장 후 필요한 DEX만 추가 구독)
+        - 없으면 전역 풀(WS_POOL)에서 (ws_url,address) 키로 하나를 획득하여 공유
+        """
+        # 기본 주소(서브계정 우선)
+        address = self.vault_address if self.vault_address else self.wallet_address
+        dex_list = list(set([d.lower() for d in (self.dex_list or ["hl"])]))
+
+        # 1) 외부에서 ws_client가 주어진 경우: 연결/구독 보장 후 필요한 DEX 구독만 추가
+        if self.ws_client is not None:
+            # comment: 주소가 다르면 유저 스트림(webData3/spotState)은 이 인스턴스와 불일치할 수 있음
+            try:
+                await self.ws_client.ensure_spot_token_map_http() # rest api
+                await self.ws_client.ensure_connected_and_subscribed()
+                # 필요한 DEX를 동일 커넥션에서 추가 구독
+                for dex in dex_list:
+                    await self.ws_client.ensure_allmids_for(None if dex == "hl" else dex)
+            except Exception as e:
+                raise
+            return
+
+        # 2) 풀에서 획득(없으면 생성) → 연결/구독은 풀에서 처리
+        #    키: (ws_base, address)
+        #    참고: address=None이면 '가격 전용' 공유 커넥션
+        # 풀 acquire
+        client = await WS_POOL.acquire(
+            ws_url=self.ws_base,
+            http_base=self.http_base,
+            address=address,
+            dex=None,  # comment: 우선 기본(HL) allMids
+        )
+        # 필요한 다른 DEX allMids도 추가 구독
+        for dex in dex_list:
+            if dex != "hl":
+                await client.ensure_allmids_for(dex)
+
+        self.ws_client = client
+        self._ws_owned = True
+        self._ws_pool_key = (self.ws_base, (address or "").lower())
 
     async def create_order(self, symbol, side, amount, price=None, order_type='market'):
         pass
@@ -196,15 +270,21 @@ class HyperliquidExchange(MultiPerpDexMixin,MultiPerpDex):
     async def cancel_orders(self, symbol):
         pass
 
-    async def get_mark_price(self,symbol):
+    async def get_mark_price(self,symbol,*,is_spot=False):
+        if self.fetch_by_ws:
+            try:
+                return await self.get_mark_price_ws(symbol,is_spot=is_spot)
+            except Exception as e:
+                pass # fallback to rest api
+        
+        # default rest api
+    
+    async def get_mark_price_ws(self,symbol,*,is_spot=False):
         pass
 
     async def get_open_orders(self, symbol):
         pass
     
-    async def close_position(self, symbol, position, *, is_reduce_only=False):
-        pass
-
 
 async def test():
     hl = HyperliquidExchange()
