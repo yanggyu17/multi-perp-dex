@@ -2,51 +2,91 @@ from multi_perp_dex import MultiPerpDex, MultiPerpDexMixin
 from .hyperliquid_ws_client import HLWSClientRaw, WS_POOL
 from mpdex.utils.common_hyperliquid import parse_hip3_symbol, round_to_tick, format_price, format_size
 import json
-from typing import Dict, Optional, List, Dict, Tuple
+from typing import Dict, Optional, List, Dict, Tuple, Any
 import aiohttp
 from aiohttp import TCPConnector
 import asyncio
 import time
 from eth_account import Account
-from .hl_sign import sign_l1_action as hl_sign_l1_action
+
+# to do: signing method 수정
+
+DEFAULT_BASE_URL = "https://wallet-service.superstack.xyz"
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "superstack-aiohttp/0.1",
+}
+
+async def get_superstack_payload(
+    api_key: str,
+    action: Dict[str, Any],
+    base_url: str = DEFAULT_BASE_URL,
+) -> Dict[str, Any]:
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
+        return await _perform_payload_request(api_key, action, base_url, session)
+
+async def _perform_payload_request(
+    api_key: str,
+    action: Dict[str, Any],
+    base_url: str,
+    session: aiohttp.ClientSession
+) -> Dict[str, Any]:
+    """get_superstack_payload의 핵심 로직을 수행합니다."""
+    url = f"{base_url.rstrip('/')}/api/exchange"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    req = {"action": action}
+
+    async with session.post(url, headers=headers, json=req) as response:
+        await _raise_if_bad_response(response)
+        exchange_resp = await response.json()
+    
+    payload = exchange_resp.get("payload")
+    if payload is None:
+        raise ValueError("superstack API 응답에서 'payload'를 찾을 수 없습니다.")
+
+    return payload
+
+async def _raise_if_bad_response(resp: aiohttp.ClientResponse) -> None:
+    """HTTP 응답 상태 코드가 2xx가 아닐 경우 예외를 발생시킵니다."""
+    if 200 <= resp.status < 300:
+        return
+    
+    ctype = resp.headers.get("content-type", "")
+    text = await resp.text()
+
+    if "text/html" in ctype.lower():
+        # HTML 응답은 보통 WAF나 IP 차단 문제일 가능성이 높음
+        raise RuntimeError(f"Request blocked (HTTP {resp.status} HTML). Likely WAF/IP whitelist issue. Body preview: {text[:300]}...")
+    
+    # JSON 에러 포맷이 일정치 않으므로 원문을 그대로 노출
+    raise RuntimeError(f"HTTP {resp.status}: {text[:400]}...")
 
 BASE_URL = "https://api.hyperliquid.xyz"
 BASE_WS = "wss://api.hyperliquid.xyz/ws"
 STABLES = ["USDC","USDT0","USDH"]
 
-class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
+class SuperstackExchange(MultiPerpDexMixin, MultiPerpDex):
+    # superstack은 hyperliquid perp를 사용하지만, 자체 지갑 provider를 사용하여
+    # signing 방식은 지갑 api를 사용해야함
+    # 즉 builder code와 fee는 따로 설정해야함
     def __init__(self, 
               wallet_address = None,        # required
-              wallet_private_key = None,    # optional, required when by_agent = False
-              agent_api_address = None,     # optional, required when by_agent = True
-              agent_api_private_key = None, # optional, required when by_agent = True
-              by_agent = True,              # recommend to use True
-              vault_address = None,         # optional, sub-account address
-              builder_code = None,
+              api_key = None,               # required
+              #builder_code = None, 하드코딩
               builder_fee_pair: dict = None,     # {"base","dex"# optional,"xyz" # optional,"vntl" #optional,"flx" #optional}
               *,
               fetch_by_ws = False, # fetch pos, balance, and price by ws client
               FrontendMarket = False,
-              # ws_client = None, # ws client가 외부에서 생성됐으면 그걸 사용, acquire 알고리즘으로 불필요
-              # ws_client의 경우 WS_POOL 하나를 공유
-              # signing_method = None, # special case: superstack, tread.fi, 분리?
+              # ws_client의 경우 WS_POOL 하나를 공유 (hyperliquid의 것)
               ):
 
-        self.by_agent = by_agent
         self.wallet_address = wallet_address
+        self.api_key = api_key
 
-        # need error check
-        if self.by_agent == False:
-            self.wallet_private_key = wallet_private_key
-            self.agent_api_address = None
-            self.agent_api_private_key = None
-        else:
-            self.wallet_private_key = None
-            self.agent_api_address = agent_api_address
-            self.agent_api_private_key = agent_api_private_key
-
-        self.vault_address = vault_address
-        self.builder_code = self._get_builder_code(builder_code)
+        self.builder_code = "0xcdb943570bcb48a6f1d3228d0175598fea19e87b"
         self.builder_fee_pair = builder_fee_pair
         
         self.http_base = BASE_URL
@@ -76,35 +116,7 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
         self._ws_init_lock = asyncio.Lock()             # comment: create_ws_client 중복 호출 방지
         self.fetch_by_ws = fetch_by_ws
         self.FrontendMarket = FrontendMarket
-        #self.signing_method = signing_method
 
-    def _get_builder_code(self, builder_code:str = None):
-        if builder_code:
-            if builder_code.startswith('0x'):
-                return builder_code # fallback to original
-            else:
-                match builder_code.lower():
-                    case 'lit' | 'lit.trade' | 'littrade':
-                        return "0x24a747628494231347f4f6aead2ec14f50bcc8b7"
-                    case 'based' | 'basedone' | 'basedapp':
-                        return "0x1924b8561eef20e70ede628a296175d358be80e5"
-                    case 'dexari':
-                        return "0x7975cafdff839ed5047244ed3a0dd82a89866081"
-                    case 'liquid':
-                        return "0x6d4e7f472e6a491b98cbeed327417e310ae8ce48"
-                    case 'supercexy':
-                        return "0x0000000bfbf4c62c43c2e71ef0093f382bf7a7b4"
-                    case 'bullpen':
-                        return "0x4c8731897503f86a2643959cbaa1e075e84babb7"
-                    case 'mass':
-                        return "0xf944069b489f1ebff4c3c6a6014d58cbef7c7009"
-                    case 'dreamcash':
-                        return "0x4950994884602d1b6c6d96e4fe30f58205c39395"
-                    #case 'superstack':
-                    #    return "0xcdb943570bcb48a6f1d3228d0175598fea19e87b"
-                    #case 'tread.fi' | 'treadfi':
-                    #    return "0x999a4b5f268a8fbf33736feff360d462ad248dbf"
-    
     def _parse_fee_pair(self, raw) -> tuple[int, int]:
         if raw is None:
             return (0, 0)

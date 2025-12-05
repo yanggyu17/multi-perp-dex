@@ -15,6 +15,8 @@ from eth_account import Account
 from eth_account.messages import encode_defunct  
 
 class TreadfiHlExchange(MultiPerpDexMixin, MultiPerpDex):
+	# To do: hyperliquid의 ws를 사용해서 position과 가격을 fetch하도록 수정할것
+	# tread.fi는 자체 front api를 사용하여 주문을 넣기때문에 builder code와 fee를 따로 설정안해도댐.
 	def __init__(
         self,
         session_cookies: Optional[Dict[str, str]] = None,
