@@ -25,6 +25,8 @@ attrs==25.3.0
     # via aiohttp
 backports-weakref==1.0.post1
     # via grvt-pysdk
+base58==2.1.1
+    # via -r requirements.in
 bitarray==3.3.1
     # via eth-account
 cachetools==5.5.2
@@ -131,9 +133,11 @@ inflection==0.5.1
     # via grvt-pysdk
 iniconfig==2.1.0
     # via pytest
+jsonalias==0.1.1
+    # via solders
 lark==1.2.2
     # via cairo-lang
-lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@b8858044e0d24abf6462451bf4d3608b790370d4
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@aecdec059f92a25510cad341a257b992d95ba7c2
     # via -r requirements.in
 marshmallow==3.26.1
     # via
@@ -152,6 +156,8 @@ mpmath==1.3.0
     # via
     #   cairo-lang
     #   sympy
+msgpack==1.1.2
+    # via -r requirements.in
 multidict==6.4.3
     # via
     #   aiohttp
@@ -231,6 +237,8 @@ six==1.17.0
     #   ecdsa
     #   pytest-profiling
     #   python-dateutil
+solders==0.27.1
+    # via -r requirements.in
 sympy==1.13.3
     # via cairo-lang
 tomli==2.2.1
@@ -251,6 +259,7 @@ typing-extensions==4.13.2
     #   multidict
     #   pydantic
     #   pydantic-core
+    #   solders
     #   typing-inspect
     #   typing-inspection
     #   web3

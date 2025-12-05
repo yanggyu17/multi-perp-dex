@@ -15,6 +15,9 @@
 - TreadFi (프론트 api 사용) / login, logout, create_order 가능
 - Variational (프론트 api 사용)
 - Pacifica (공식 api)
+- Hyperliquid (공식 api)
+  - price / position 조회: 웹소켓사용, 여러 instance를 만들어도 WS_POOL 공통모듈로 통신
+  - 주문: rest api
 
 ---
 
@@ -65,6 +68,8 @@ wrappers/               # 거래소별 래퍼 구현
   variational_auth.py
   variational.py
   pacifica.py
+  hyperliquid_ws_client.py # 웹소켓
+  hyperliquid.py
 mpdex/__init__.py       # 공개 API(지연 임포트), create_exchange/symbol_create 노출
 multi_perp_dex.py       # 공통 인터페이스(추상 클래스) 및 Mixin
 exchange_factory.py     # 문자열→래퍼 매핑, 지연 임포트 및 심볼 생성

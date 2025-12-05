@@ -268,7 +268,7 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
                 self.perp_asset_map[key] = (asset_id, szd)
 
         self._perp_meta_inited = True
-
+    
     # 캐시 조회로 변경
     async def _resolve_perp_asset_and_szdec(self, dex: Optional[str], coin_key: str) -> tuple[Optional[int], int]:
         """
@@ -281,6 +281,24 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
 
         key = coin_key if dex else coin_key.upper()
         return self.perp_asset_map.get(key, (None, 0))
+
+    # 심볼 → asset id 해석(spot/perp 공용)
+    async def _resolve_asset_id_for_symbol(self, symbol: str, *, is_spot: bool) -> int:
+        raw = str(symbol).strip()
+        if is_spot or ("/" in raw):
+            pair = raw.upper()
+            if not self.spot_asset_pair_to_index:
+                raise RuntimeError("spot meta not initialized")
+            pair_idx = self.spot_asset_pair_to_index.get(pair)
+            if pair_idx is None:
+                raise RuntimeError(f"unknown spot pair: {pair}")
+            return 10000 + int(pair_idx)
+        # perp (HL/HIP-3)
+        dex, coin_key = parse_hip3_symbol(raw)
+        asset_id, _ = await self._resolve_perp_asset_and_szdec(dex, coin_key)
+        if asset_id is None:
+            raise RuntimeError(f"asset index not found for {raw}")
+        return int(asset_id)
 
     def _sign_hl_action(self, action: dict) -> tuple[int, dict]:
         if not self.wallet_address or not self.wallet_address.startswith("0x"):
@@ -587,8 +605,8 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
         price=None,
         order_type='market',
         *,
+        is_reduce_only = False,
         is_spot: bool = False,
-        reduce_only: bool = False,
         tif: Optional[str] = None,
         client_id: Optional[str] = None,
         slippage: Optional[float] = 0.05
@@ -644,7 +662,7 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
                 "b": bool(is_buy),
                 "p": price_str,
                 "s": size_str,
-                "r": bool(reduce_only),
+                "r": bool(is_reduce_only),
                 "t": {"limit": {"tif": tif_final}},
             }
             if client_id:
@@ -713,7 +731,7 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
             "b": bool(is_buy),
             "p": price_str,
             "s": size_str,
-            "r": bool(reduce_only),
+            "r": bool(is_reduce_only),
             "t": {"limit": {"tif": tif_final}},
         }
         if client_id:
@@ -874,7 +892,7 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
         return None
     
     async def close_position(self, symbol, position):
-        return await super().close_position(symbol, position)
+        return await super().close_position(symbol, position, is_reduce_only=True)
     
     async def get_collateral(self):
         if self.fetch_by_ws:
@@ -1183,8 +1201,139 @@ class HyperliquidExchange(MultiPerpDexMixin, MultiPerpDex):
                 pass
         return await self.get_open_orders_rest(symbol, dex="ALL_DEXS")
 
-    async def cancel_orders(self, symbol):
-        pass
+    # cancel 응답 파서: 성공/오류 판정
+    def _extract_cancel_status(self, raw) -> bool:
+        """
+        성공 시 True, 오류 메시지 있으면 RuntimeError(error)를 발생시킵니다.
+        """
+        def _collect_errors(node, sink: list):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k in ("error", "reason", "message") and isinstance(v, str) and v.strip():
+                        sink.append(v.strip())
+                    elif isinstance(v, (dict, list)):
+                        _collect_errors(v, sink)
+            elif isinstance(node, list):
+                for it in node:
+                    _collect_errors(it, sink)
+
+        obj = raw[0] if isinstance(raw, list) and raw else raw
+        if not isinstance(obj, dict):
+            raise RuntimeError("invalid cancel response")
+
+        resp = obj.get("response") or obj
+        data = resp.get("data") or {}
+        statuses = data.get("statuses")
+        # 1) 에러 우선 탐지
+        errors = []
+        if statuses is not None:
+            _collect_errors(statuses, errors)
+        if not errors:
+            _collect_errors(obj, errors)
+        if errors:
+            raise RuntimeError(errors[0])
+
+        # 2) 'success' 확인
+        if isinstance(statuses, list) and all((isinstance(x, str) and x.lower() == "success") for x in statuses):
+            return True
+
+        # 상태가 비어있거나 알 수 없는 형식인 경우도 보수적으로 성공 처리하지 않음
+        raise RuntimeError("unknown cancel response")
+
+    # 단일 주문 취소
+    async def cancel_order(self, symbol: str, order_id: int | str, *, is_spot: bool = False):
+        """
+        단일 주문 취소.
+        성공: True
+        실패: 오류 메시지(str)
+        """
+        try:
+            asset_id = await self._resolve_asset_id_for_symbol(symbol, is_spot=is_spot)
+            cancels = [{"a": int(asset_id), "o": int(order_id)}]
+            action = {"type": "cancel", "cancels": cancels}
+
+            nonce, sig = self._sign_hl_action(action)
+            payload = {"action": action, "nonce": nonce, "signature": sig}
+            if self.vault_address:
+                payload["vaultAddress"] = self.vault_address
+
+            url = f"{self.http_base}/exchange"
+            s = self._session()
+            async with s.post(url, json=payload, headers={"Content-Type": "application/json"}) as r:
+                r.raise_for_status()
+                resp = await r.json()
+
+            # 성공/실패 판정
+            _ = self._extract_cancel_status(resp)
+            return True
+        except Exception as e:
+            return str(e)
+        
+    async def cancel_orders(self, symbol, open_orders = None, *, is_spot=False):
+        """
+        open_orders가 주어지면 그 목록을, 없으면 get_open_orders(symbol)로 조회한 목록을 취소합니다.
+        반환: List[{"order_id": ..., "symbol": ..., "ok": bool, "error": Optional[str]}]
+        """
+        if open_orders is None:
+            open_orders = await self.get_open_orders(symbol)
+            
+        if not open_orders:
+            #print(f"[cancel_orders] No open orders for {symbol}")
+            return []
+        
+        asset_cache: dict[str, int] = {}
+
+        cancels = []
+        results = []
+        for od in open_orders:
+            oid = od.get("order_id")
+            sym = od.get("symbol") or symbol
+            if oid is None:
+                results.append({"order_id": oid, "symbol": sym, "ok": False, "error": "missing order_id"})
+                continue
+            # 심볼 기준으로 spot/perp 판별
+            sym_is_spot = is_spot or ("/" in str(sym))
+            try:
+                if sym not in asset_cache:
+                    asset_cache[sym] = await self._resolve_asset_id_for_symbol(sym, is_spot=sym_is_spot)
+                cancels.append({"a": int(asset_cache[sym]), "o": int(oid)})
+                # 임시 결과(성공 가정), 실패 시 나중에 덮어씀
+                results.append({"order_id": int(oid), "symbol": sym, "ok": None, "error": None})
+            except Exception as e:
+                results.append({"order_id": oid, "symbol": sym, "ok": False, "error": str(e)})
+
+        # 취소할 게 없으면 조기 반환
+        pending = [r for r in results if r["ok"] is None]
+        if not pending:
+            return results
+
+        action = {"type": "cancel", "cancels": cancels}
+        try:
+            nonce, sig = self._sign_hl_action(action)
+            payload = {"action": action, "nonce": nonce, "signature": sig}
+            if self.vault_address:
+                payload["vaultAddress"] = self.vault_address
+
+            url = f"{self.http_base}/exchange"
+            s = self._session()
+            async with s.post(url, json=payload, headers={"Content-Type": "application/json"}) as r:
+                r.raise_for_status()
+                resp = await r.json()
+
+            # 응답 판정
+            # 성공이면 모두 ok=True로 업데이트
+            _ = self._extract_cancel_status(resp)
+            for r in results:
+                if r["ok"] is None:
+                    r["ok"] = True
+            return results
+        except Exception as e:
+            # 배치 실패: 대기 중이던 항목들을 일괄 실패 처리
+            for r in results:
+                if r["ok"] is None:
+                    r["ok"] = False
+                    r["error"] = str(e)
+            return results
 
     # 내부 헬퍼: Spot 후보 페어 생성(우선순위 고정)
     def _spot_pair_candidates(self, raw_symbol: str) -> list[str]:

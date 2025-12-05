@@ -23,6 +23,7 @@ dependencies = [
   "lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@c9b8de6fd6864ede0fd7fb61d85ffb3614d178c9",
   "grvt-pysdk>=0.1.24",
   "cairo-lang==0.13.5",
+  "msgpack==1.1.2",
 
   # [ADDED] Windows(Py3.10, AMD64) 한정: fastecdsa 사전빌드 휠 자동 설치
   # - pip, uv 모두 PEP 508 마커를 해석합니다.
